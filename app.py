@@ -26,9 +26,18 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         def run(cmd, progress, msg):
             set_job(job_id, 'processing', progress, msg)
+            logging.info(f'[{job_id[:8]}] Running: {" ".join(cmd[:3])}...')
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             if r.returncode != 0:
-                raise RuntimeError(f'{msg} failed: {r.stderr[-400:]}')
+                logging.error(f'[{job_id[:8]}] {msg} FAILED.\nstdout: {r.stdout[-500:]}\nstderr: {r.stderr[-500:]}')
+                raise RuntimeError(f'{msg} failed: {r.stderr[-800:]}')
+            logging.info(f'[{job_id[:8]}] {msg} OK')
+
+        # Verify images exist
+        imgs = [f for f in os.listdir(image_dir) if f.lower().endswith(('.jpg','.jpeg','.png'))]
+        logging.info(f'[{job_id[:8]}] Pipeline starting with {len(imgs)} images in {image_dir}')
+        if not imgs:
+            raise RuntimeError('No valid images found in upload')
 
         # 1 — Feature extraction
         run(['colmap', 'feature_extractor',
@@ -36,7 +45,8 @@ def run_pipeline(job_id, image_dir, job_dir):
              '--image_path', image_dir,
              '--ImageReader.single_camera', '1',
              '--SiftExtraction.use_gpu', '0',
-             '--SiftExtraction.max_image_size', '1600'],
+             '--SiftExtraction.max_image_size', '1024',
+             '--SiftExtraction.max_num_features', '4096'],
             0.10, 'Extracting image features…')
 
         # 2 — Matching
