@@ -1,0 +1,4 @@
+flask==3.0.3
+werkzeug==3.0.3
+open3d==0.18.0
+usd-core==24.5
