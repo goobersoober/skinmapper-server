@@ -1,9 +1,10 @@
-FROM ubuntu:22.04
+FROM colmap/colmap:latest
+
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip \
-    colmap \
+    python3-pip \
     libgl1-mesa-glx \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*

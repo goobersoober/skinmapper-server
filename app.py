@@ -1,20 +1,37 @@
-import os, uuid, zipfile, subprocess, threading, json, shutil, logging, traceback, time
+"""
+SkinMapper Server — GPU-accelerated photogrammetry pipeline
+COLMAP (dense reconstruction) + open3d (meshing) + texture baking from photos
+"""
+
+import os, uuid, zipfile, subprocess, threading, json, shutil, logging, traceback, time, struct
 from collections import deque
 from flask import Flask, request, jsonify, send_file
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max upload
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
 
 JOBS_DIR = '/tmp/skinmapper_jobs'
-MAX_CONCURRENT = 2          # max jobs running at once
-MAX_QUEUE = 10              # max jobs waiting
-MAX_PHOTOS = 60             # reject uploads with more than this
-JOB_TTL = 3600              # keep results for 1 hour
-MAX_DIM = 1200              # downscale longest edge to this
+MAX_CONCURRENT = 2
+MAX_QUEUE = 10
+MAX_PHOTOS = 60
+JOB_TTL = 3600
+MAX_DIM = 1600  # full resolution with GPU
 
 os.makedirs(JOBS_DIR, exist_ok=True)
+
+# ── Check GPU availability at startup ────────────────────────────────
+def check_gpu():
+    r = subprocess.run(['colmap', 'feature_extractor', '--help'], capture_output=True, text=True)
+    # Also check nvidia-smi
+    gpu = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                         capture_output=True, text=True)
+    gpu_name = gpu.stdout.strip() if gpu.returncode == 0 else 'No GPU detected'
+    logging.info(f'GPU: {gpu_name}')
+    return gpu.returncode == 0, gpu_name
+
+HAS_GPU, GPU_NAME = check_gpu()
 
 # ── Job state ────────────────────────────────────────────────────────
 jobs = {}
@@ -24,10 +41,8 @@ active_count = 0
 
 def set_job(job_id, status, progress, message, result_url=None, error=None):
     with lock:
-        jobs[job_id] = dict(
-            status=status, progress=progress, message=message,
-            result_url=result_url, error=error, updated=time.time()
-        )
+        jobs[job_id] = dict(status=status, progress=progress, message=message,
+                            result_url=result_url, error=error, updated=time.time())
 
 def get_job(job_id):
     with lock:
@@ -42,8 +57,7 @@ def enqueue_job(job_id, img_dir, job_dir):
             threading.Thread(target=_run_and_release, args=(job_id, img_dir, job_dir), daemon=True).start()
         else:
             queue.append((job_id, img_dir, job_dir))
-            pos = len(queue)
-            set_job(job_id, 'queued', 0.0, f'In queue (position {pos})')
+            set_job(job_id, 'queued', 0.0, f'In queue (position {len(queue)})')
 
 def _run_and_release(job_id, img_dir, job_dir):
     global active_count
@@ -62,29 +76,34 @@ def _start_next():
             job_id, img_dir, job_dir = queue.popleft()
             threading.Thread(target=_run_and_release, args=(job_id, img_dir, job_dir), daemon=True).start()
 
-# ── Cleanup old jobs ────────────────────────────────────────────────
 def cleanup_old_jobs():
     now = time.time()
     with lock:
         expired = [jid for jid, j in jobs.items() if now - j.get('updated', 0) > JOB_TTL]
         for jid in expired:
             del jobs[jid]
-            d = os.path.join(JOBS_DIR, jid)
-            shutil.rmtree(d, ignore_errors=True)
-            logging.info(f'Cleaned up expired job {jid[:8]}')
+            shutil.rmtree(os.path.join(JOBS_DIR, jid), ignore_errors=True)
+
 
 # ── Pipeline ─────────────────────────────────────────────────────────
+
 def run_pipeline(job_id, image_dir, job_dir):
     tag = job_id[:8]
+    use_gpu = '1' if HAS_GPU else '0'
+
     try:
-        db      = os.path.join(job_dir, 'db.db')
-        sparse  = os.path.join(job_dir, 'sparse')
+        db     = os.path.join(job_dir, 'db.db')
+        sparse = os.path.join(job_dir, 'sparse')
+        dense  = os.path.join(job_dir, 'dense')
         os.makedirs(sparse, exist_ok=True)
+        os.makedirs(dense, exist_ok=True)
 
         def run(cmd, progress, msg):
             set_job(job_id, 'processing', progress, msg)
             logging.info(f'[{tag}] {msg}')
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            t0 = time.time()
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            elapsed = time.time() - t0
             if r.returncode != 0:
                 err = r.stderr.strip() or r.stdout.strip() or '(no output)'
                 if r.returncode < 0:
@@ -92,18 +111,18 @@ def run_pipeline(job_id, image_dir, job_dir):
                     signames = {9: 'SIGKILL (out of memory)', 11: 'SIGSEGV (crash)', 6: 'SIGABRT (abort)'}
                     signame = signames.get(sig, f'signal {sig}')
                     err = f'Process killed by {signame}. {err}'
-                logging.error(f'[{tag}] {msg} FAILED (exit {r.returncode}): {err[:500]}')
-                raise RuntimeError(f'{msg} failed (exit {r.returncode}): {err[:800]}')
-            logging.info(f'[{tag}] {msg} ✓')
+                logging.error(f'[{tag}] {msg} FAILED ({elapsed:.1f}s): {err[:500]}')
+                raise RuntimeError(f'{msg} failed: {err[:800]}')
+            logging.info(f'[{tag}] {msg} done ({elapsed:.1f}s)')
 
         # Verify images
-        imgs = [f for f in os.listdir(image_dir) if f.lower().endswith(('.jpg','.jpeg','.png'))]
-        logging.info(f'[{tag}] Pipeline starting with {len(imgs)} images')
+        imgs = [f for f in os.listdir(image_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        logging.info(f'[{tag}] Pipeline starting: {len(imgs)} images, GPU={HAS_GPU}')
         if not imgs:
-            raise RuntimeError('No valid images found in upload')
+            raise RuntimeError('No valid images found')
 
-        # Downscale images to save memory
-        set_job(job_id, 'processing', 0.05, 'Preparing images…')
+        # Downscale if needed
+        set_job(job_id, 'processing', 0.03, 'Preparing images…')
         from PIL import Image
         for fname in imgs:
             fpath = os.path.join(image_dir, fname)
@@ -113,116 +132,153 @@ def run_pipeline(job_id, image_dir, job_dir):
                     if max(w, h) > MAX_DIM:
                         scale = MAX_DIM / max(w, h)
                         im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-                        im.save(fpath, quality=85)
+                        im.save(fpath, quality=90)
             except Exception as e:
-                logging.warning(f'[{tag}] Could not resize {fname}: {e}')
+                logging.warning(f'[{tag}] Resize {fname}: {e}')
 
         # 1 — Feature extraction
         run(['colmap', 'feature_extractor',
              '--database_path', db,
              '--image_path', image_dir,
              '--ImageReader.single_camera', '1',
-             '--SiftExtraction.use_gpu', '0',
+             '--SiftExtraction.use_gpu', use_gpu,
              '--SiftExtraction.max_image_size', str(MAX_DIM),
-             '--SiftExtraction.max_num_features', '4096'],
-            0.10, 'Extracting image features…')
+             '--SiftExtraction.max_num_features', '8192'],
+            0.08, 'Extracting features…')
 
-        # 2 — Sequential matching (much less memory than exhaustive)
-        run(['colmap', 'sequential_matcher',
+        # 2 — Matching
+        run(['colmap', 'exhaustive_matcher',
              '--database_path', db,
-             '--SiftMatching.use_gpu', '0',
-             '--SequentialMatching.overlap', '10',
-             '--SequentialMatching.loop_detection', '0'],
-            0.25, 'Matching features across photos…')
+             '--SiftMatching.use_gpu', use_gpu],
+            0.18, 'Matching features…')
 
-        # 3 — Sparse SfM
+        # 3 — Sparse reconstruction
         run(['colmap', 'mapper',
              '--database_path', db,
              '--image_path', image_dir,
              '--output_path', sparse,
-             '--Mapper.num_threads', '2',
+             '--Mapper.num_threads', '4',
              '--Mapper.max_num_models', '1'],
-            0.40, 'Reconstructing 3D structure…')
+            0.30, 'Reconstructing structure…')
 
         sparse0 = os.path.join(sparse, '0')
         if not os.path.exists(sparse0):
-            raise RuntimeError(
-                'Could not reconstruct — take more overlapping photos with slow, steady movement.')
+            raise RuntimeError('Could not reconstruct — take more overlapping photos with slow, steady movement.')
 
-        # 4 — Export sparse point cloud to PLY (no CUDA needed)
-        ply = os.path.join(job_dir, 'sparse.ply')
-        run(['colmap', 'model_converter',
+        # 4 — Undistort images
+        run(['colmap', 'image_undistorter',
+             '--image_path', image_dir,
              '--input_path', sparse0,
-             '--output_path', ply,
-             '--output_type', 'PLY'],
-            0.50, 'Exporting point cloud…')
+             '--output_path', dense,
+             '--output_type', 'COLMAP',
+             '--max_image_size', str(MAX_DIM)],
+            0.38, 'Undistorting images…')
 
-        # 5 — Densify using multi-view stereo via open3d (CPU-based)
-        set_job(job_id, 'processing', 0.55, 'Building mesh…')
+        # 5 — Dense stereo (GPU accelerated)
+        run(['colmap', 'patch_match_stereo',
+             '--workspace_path', dense,
+             '--workspace_format', 'COLMAP',
+             '--PatchMatchStereo.geom_consistency', 'true',
+             '--PatchMatchStereo.max_image_size', str(MAX_DIM)],
+            0.52, 'Computing depth maps (GPU)…')
+
+        # 6 — Fuse into dense point cloud
+        ply_path = os.path.join(job_dir, 'dense.ply')
+        run(['colmap', 'stereo_fusion',
+             '--workspace_path', dense,
+             '--workspace_format', 'COLMAP',
+             '--input_type', 'geometric',
+             '--output_path', ply_path],
+            0.62, 'Fusing point cloud…')
+
+        # 7 — Mesh with open3d
+        set_job(job_id, 'processing', 0.66, 'Building mesh…')
         import open3d as o3d
         import numpy as np
 
-        pcd = o3d.io.read_point_cloud(ply)
+        pcd = o3d.io.read_point_cloud(ply_path)
         pts = len(pcd.points)
-        logging.info(f'[{tag}] Sparse point cloud: {pts} points')
+        logging.info(f'[{tag}] Dense cloud: {pts} points')
 
-        # Remove statistical outliers
+        if pts < 500:
+            raise RuntimeError(f'Only {pts} points — take more overlapping photos.')
+
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        pts = len(pcd.points)
-        logging.info(f'[{tag}] Point cloud: {pts} points')
+        logging.info(f'[{tag}] After cleanup: {len(pcd.points)} points')
 
-        if pts < 200:
-            raise RuntimeError(
-                f'Only {pts} 3D points reconstructed — not enough for a mesh. '
-                'Try taking more photos with more overlap and steady movement.')
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30))
+        pcd.orient_normals_consistent_tangent_plane(100)
 
-        logging.info(f'[{tag}] After outlier removal: {pts} points')
+        if len(pcd.points) > 500000:
+            pcd = pcd.voxel_down_sample(0.001)
 
-        pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-        pcd.orient_normals_consistent_tangent_plane(50)
+        set_job(job_id, 'processing', 0.72, 'Creating surface…')
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+        densities = np.asarray(densities)
+        mesh.remove_vertices_by_mask(densities < np.quantile(densities, 0.05))
 
-        # Downsample if huge point cloud to save memory
-        if pts > 200000:
-            voxel = 0.002
-            pcd = pcd.voxel_down_sample(voxel)
-            logging.info(f'[{tag}] Downsampled to {len(pcd.points)} points')
-
-        set_job(job_id, 'processing', 0.65, 'Creating surface…')
-
-        # Use ball-pivoting for sparse clouds, Poisson for dense
-        if pts < 5000:
-            # Ball-pivoting works better with sparse point clouds
-            distances = pcd.compute_nearest_neighbor_distance()
-            avg_dist = np.mean(distances)
-            radii = [avg_dist * 1.5, avg_dist * 3.0, avg_dist * 6.0]
-            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-                pcd, o3d.utility.DoubleVector(radii))
-            logging.info(f'[{tag}] Ball-pivoting mesh: {len(mesh.triangles)} triangles')
-        else:
-            poisson_depth = 8 if pts < 100000 else 9
-            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                pcd, depth=poisson_depth)
-            # Remove low-density Poisson artifacts
-            densities = np.asarray(densities)
-            threshold = np.quantile(densities, 0.05)
-            mesh.remove_vertices_by_mask(densities < threshold)
-            logging.info(f'[{tag}] Poisson mesh: {len(mesh.triangles)} triangles')
-
-        if len(mesh.triangles) == 0:
-            raise RuntimeError('Mesh generation failed — try photos with more overlap.')
-
-        target_faces = min(50000, len(mesh.triangles))
-        if len(mesh.triangles) > target_faces:
-            mesh = mesh.simplify_quadric_decimation(target_faces)
+        target = min(100000, len(mesh.triangles))
+        if len(mesh.triangles) > target:
+            mesh = mesh.simplify_quadric_decimation(target)
         mesh.compute_vertex_normals()
 
-        set_job(job_id, 'processing', 0.90, 'Exporting mesh…')
-        obj_path = os.path.join(job_dir, 'result.obj')
-        o3d.io.write_triangle_mesh(obj_path, mesh, write_ascii=True)
+        logging.info(f'[{tag}] Mesh: {len(mesh.vertices)} verts, {len(mesh.triangles)} tris')
+        if len(mesh.triangles) == 0:
+            raise RuntimeError('Mesh generation failed — try more overlapping photos.')
 
-        result_size = os.path.getsize(obj_path)
-        logging.info(f'[{tag}] Done! OBJ: {result_size} bytes, {len(mesh.triangles)} triangles')
+        # 8 — UV unwrap (cylindrical)
+        set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
+        vertices = np.asarray(mesh.vertices)
+        triangles = np.asarray(mesh.triangles)
+
+        center = vertices.mean(axis=0)
+        centered = vertices - center
+        cov = np.cov(centered.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        axis = eigenvectors[:, np.argmax(eigenvalues)]
+        ref = eigenvectors[:, np.argsort(eigenvalues)[-2]]
+
+        along = centered @ axis
+        radial = centered - np.outer(along, axis)
+        u = np.arctan2(np.sum(radial * np.cross(axis, ref), axis=1),
+                        np.sum(radial * ref, axis=1))
+        u = (u + np.pi) / (2 * np.pi)
+
+        v_min, v_max = along.min(), along.max()
+        v = (along - v_min) / max(v_max - v_min, 1e-6)
+
+        uvs = np.column_stack([u, v])
+
+        # 9 — Bake texture from photos
+        set_job(job_id, 'processing', 0.80, 'Baking skin texture…')
+        texture = bake_texture(
+            vertices, triangles, uvs, sparse0,
+            os.path.join(dense, 'images'), tag
+        )
+
+        # 10 — Export OBJ + MTL + texture as zip
+        set_job(job_id, 'processing', 0.92, 'Packaging result…')
+        result_dir = os.path.join(job_dir, 'result')
+        os.makedirs(result_dir, exist_ok=True)
+
+        tex_path = os.path.join(result_dir, 'mesh.png')
+        if texture is not None:
+            texture.save(tex_path)
+
+        obj_path = os.path.join(result_dir, 'mesh.obj')
+        mtl_path = os.path.join(result_dir, 'mesh.mtl')
+        write_obj(vertices, triangles, uvs, obj_path, mtl_path, os.path.exists(tex_path))
+
+        # Zip it all up
+        zip_path = os.path.join(job_dir, f'{job_id}.zip')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.write(obj_path, 'mesh.obj')
+            zf.write(mtl_path, 'mesh.mtl')
+            if os.path.exists(tex_path):
+                zf.write(tex_path, 'mesh.png')
+
+        result_size = os.path.getsize(zip_path)
+        logging.info(f'[{tag}] Done! {len(mesh.vertices)} verts, {len(mesh.triangles)} tris, zip={result_size} bytes')
         set_job(job_id, 'done', 1.0, 'Reconstruction complete!',
                 result_url=f'/result/{job_id}')
 
@@ -230,30 +286,191 @@ def run_pipeline(job_id, image_dir, job_dir):
         logging.error(f'[{tag}] Pipeline error: {traceback.format_exc()}')
         set_job(job_id, 'error', 0, str(e), error=str(e))
     finally:
-        # Clean up intermediate files, keep only the .usdz result
-        for d in [image_dir, sparse]:
+        for d in [image_dir, sparse, dense, os.path.join(job_dir, 'result')]:
             shutil.rmtree(d, ignore_errors=True)
-        for f in [db, os.path.join(job_dir, 'sparse.ply')]:
+        for f in [db, os.path.join(job_dir, 'dense.ply')]:
             try: os.remove(f)
             except: pass
+
+
+# ── Texture baking ───────────────────────────────────────────────────
+
+def bake_texture(vertices, triangles, uvs, sparse_path, image_dir, tag, tex_size=4096):
+    """Project photos onto mesh using COLMAP camera poses."""
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    try:
+        cameras = read_colmap_cameras_bin(os.path.join(sparse_path, 'cameras.bin'))
+        images_meta = read_colmap_images_bin(os.path.join(sparse_path, 'images.bin'))
+
+        if not cameras or not images_meta:
+            logging.warning(f'[{tag}] No camera data — skipping texture')
+            return None
+
+        tex = Image.new('RGB', (tex_size, tex_size), (180, 144, 120))
+        tex_arr = np.array(tex)
+        weight_buf = np.zeros((tex_size, tex_size), dtype=np.float32)
+
+        for img_data in images_meta.values():
+            cam = cameras.get(img_data['camera_id'])
+            if not cam:
+                continue
+
+            img_path = os.path.join(image_dir, img_data['name'])
+            if not os.path.exists(img_path):
+                continue
+
+            try:
+                photo = np.array(Image.open(img_path))
+                ph, pw = photo.shape[:2]
+            except:
+                continue
+
+            fx, fy, cx, cy = cam['params'][:4]
+            R = img_data['R']
+            t = img_data['t']
+
+            # Project all vertices to this camera
+            cam_pts = (R @ vertices.T).T + t
+            valid = cam_pts[:, 2] > 0.01
+
+            px = (fx * cam_pts[:, 0] / cam_pts[:, 2] + cx)
+            py = (fy * cam_pts[:, 1] / cam_pts[:, 2] + cy)
+            depths = cam_pts[:, 2]
+
+            # For each triangle, check if all 3 vertices project into this view
+            for tri in triangles:
+                v0, v1, v2 = tri
+                if not (valid[v0] and valid[v1] and valid[v2]):
+                    continue
+
+                # Check all 3 pixel coords are in frame
+                pxs = [px[v0], px[v1], px[v2]]
+                pys = [py[v0], py[v1], py[v2]]
+                if any(x < 0 or x >= pw for x in pxs) or any(y < 0 or y >= ph for y in pys):
+                    continue
+
+                # Rasterize triangle in UV space
+                uv0, uv1, uv2 = uvs[v0], uvs[v1], uvs[v2]
+                tu = [int(uv0[0] * (tex_size-1)), int(uv1[0] * (tex_size-1)), int(uv2[0] * (tex_size-1))]
+                tv = [int((1-uv0[1]) * (tex_size-1)), int((1-uv1[1]) * (tex_size-1)), int((1-uv2[1]) * (tex_size-1))]
+
+                # Simple: sample at each vertex
+                avg_depth = (depths[v0] + depths[v1] + depths[v2]) / 3
+                weight = 1.0 / max(avg_depth, 0.1)
+
+                for k in range(3):
+                    sx, sy = int(pxs[k]), int(pys[k])
+                    tx, ty = max(0, min(tex_size-1, tu[k])), max(0, min(tex_size-1, tv[k]))
+
+                    if sy < ph and sx < pw and weight > weight_buf[ty, tx] * 0.5:
+                        color = photo[sy, sx]
+                        if len(color) >= 3:
+                            old_w = weight_buf[ty, tx]
+                            new_w = old_w + weight
+                            # Weighted average blending
+                            tex_arr[ty, tx] = (tex_arr[ty, tx].astype(float) * old_w + color[:3].astype(float) * weight) / new_w
+                            weight_buf[ty, tx] = new_w
+
+        # Fill gaps by dilating
+        result = Image.fromarray(tex_arr.astype(np.uint8))
+        painted = weight_buf > 0
+        painted_pct = painted.sum() / painted.size * 100
+        logging.info(f'[{tag}] Texture: {painted_pct:.1f}% painted from {len(images_meta)} views')
+
+        # Dilate to fill small gaps
+        for _ in range(5):
+            result = result.filter(ImageFilter.MedianFilter(3))
+
+        return result
+
+    except Exception as e:
+        logging.error(f'[{tag}] Texture bake failed: {traceback.format_exc()}')
+        return None
+
+
+# ── COLMAP binary readers ────────────────────────────────────────────
+
+def read_colmap_cameras_bin(path):
+    cameras = {}
+    if not os.path.exists(path):
+        return cameras
+    with open(path, 'rb') as f:
+        n = struct.unpack('<Q', f.read(8))[0]
+        for _ in range(n):
+            cam_id = struct.unpack('<I', f.read(4))[0]
+            model_id = struct.unpack('<i', f.read(4))[0]
+            w = struct.unpack('<Q', f.read(8))[0]
+            h = struct.unpack('<Q', f.read(8))[0]
+            np_map = {0:3, 1:4, 2:4, 3:5, 4:4, 5:5}
+            num_p = np_map.get(model_id, 4)
+            params = struct.unpack(f'<{num_p}d', f.read(8*num_p))
+            cameras[cam_id] = {'w': w, 'h': h, 'params': params}
+    return cameras
+
+
+def read_colmap_images_bin(path):
+    import numpy as np
+    images = {}
+    if not os.path.exists(path):
+        return images
+    with open(path, 'rb') as f:
+        n = struct.unpack('<Q', f.read(8))[0]
+        for _ in range(n):
+            img_id = struct.unpack('<I', f.read(4))[0]
+            qw, qx, qy, qz = struct.unpack('<4d', f.read(32))
+            tx, ty, tz = struct.unpack('<3d', f.read(24))
+            cam_id = struct.unpack('<I', f.read(4))[0]
+            name = b''
+            while True:
+                c = f.read(1)
+                if c == b'\x00': break
+                name += c
+            num_pts = struct.unpack('<Q', f.read(8))[0]
+            f.read(num_pts * 24)
+            # Quaternion to rotation matrix
+            R = np.array([
+                [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+                [2*(qx*qy+qz*qw), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+                [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1-2*(qx*qx+qy*qy)]
+            ])
+            images[img_id] = {'name': name.decode(), 'camera_id': cam_id, 'R': R, 't': np.array([tx,ty,tz])}
+    return images
+
+
+# ── OBJ writer ───────────────────────────────────────────────────────
+
+def write_obj(vertices, triangles, uvs, obj_path, mtl_path, has_texture):
+    with open(mtl_path, 'w') as f:
+        f.write("newmtl skin\nKa 0.2 0.2 0.2\nKd 0.8 0.8 0.8\nKs 0.0 0.0 0.0\n")
+        if has_texture:
+            f.write("map_Kd mesh.png\n")
+
+    with open(obj_path, 'w') as f:
+        f.write("mtllib mesh.mtl\nusemtl skin\n\n")
+        for v in vertices:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for uv in uvs:
+            f.write(f"vt {uv[0]:.6f} {uv[1]:.6f}\n")
+        for tri in triangles:
+            f.write(f"f {tri[0]+1}/{tri[0]+1} {tri[1]+1}/{tri[1]+1} {tri[2]+1}/{tri[2]+1}\n")
 
 
 # ── Routes ───────────────────────────────────────────────────────────
 
 @app.errorhandler(413)
 def too_large(e):
-    return jsonify(error='Upload too large. Please use fewer or smaller photos.'), 413
+    return jsonify(error='Upload too large. Use fewer or smaller photos.'), 413
 
 @app.errorhandler(500)
 def server_error(e):
     original = getattr(e, 'original_exception', None)
-    msg = str(original) if original else str(e)
-    return jsonify(error=f'Server error: {msg}'), 500
+    return jsonify(error=f'Server error: {str(original or e)}'), 500
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    tb = traceback.format_exc()
-    logging.error(f'Unhandled: {tb}')
+    logging.error(f'Unhandled: {traceback.format_exc()}')
     return jsonify(error=f'{type(e).__name__}: {str(e)}'), 500
 
 
@@ -262,41 +479,35 @@ def health():
     cleanup_old_jobs()
     colmap_ok = shutil.which('colmap') is not None
     try:
-        import open3d
-        o3d_ok = True
+        import open3d; o3d_ok = True
     except ImportError:
         o3d_ok = False
     with lock:
-        queued = len(queue)
-        running = active_count
-    return jsonify(status='ok', colmap=colmap_ok, open3d=o3d_ok,
-                   version='2.0.0', active_jobs=running, queued_jobs=queued)
+        q, a = len(queue), active_count
+    return jsonify(status='ok', colmap=colmap_ok, open3d=o3d_ok, gpu=HAS_GPU,
+                   gpu_name=GPU_NAME, version='3.0.0', active_jobs=a, queued_jobs=q)
 
 
 @app.route('/submit', methods=['POST'])
 def submit():
     try:
         cleanup_old_jobs()
-
-        # Check queue capacity
         with lock:
-            total = active_count + len(queue)
-        if total >= MAX_QUEUE:
-            return jsonify(error='Server is busy. Please try again in a few minutes.'), 503
+            if active_count + len(queue) >= MAX_QUEUE:
+                return jsonify(error='Server busy — try again in a few minutes.'), 503
 
-        logging.info(f'Submit: content_length={request.content_length}')
         if 'photos' not in request.files:
-            return jsonify(error='No photos file in upload'), 400
+            return jsonify(error='No photos in upload'), 400
 
         f = request.files['photos']
-        job_id  = str(uuid.uuid4())
+        job_id = str(uuid.uuid4())
         job_dir = os.path.join(JOBS_DIR, job_id)
         img_dir = os.path.join(job_dir, 'images')
         os.makedirs(img_dir, exist_ok=True)
 
         zip_path = os.path.join(job_dir, 'photos.zip')
         f.save(zip_path)
-        logging.info(f'[{job_id[:8]}] Saved zip: {os.path.getsize(zip_path)} bytes')
+        logging.info(f'[{job_id[:8]}] Upload: {os.path.getsize(zip_path)} bytes')
 
         with zipfile.ZipFile(zip_path) as zf:
             for m in zf.namelist():
@@ -307,44 +518,39 @@ def submit():
         os.remove(zip_path)
 
         count = len(os.listdir(img_dir))
-        logging.info(f'[{job_id[:8]}] Extracted {count} images')
-
         if count < 10:
             shutil.rmtree(job_dir, ignore_errors=True)
-            return jsonify(error=f'Only {count} photos — need at least 10 for a good scan.'), 400
-
+            return jsonify(error=f'Only {count} photos — need at least 10.'), 400
         if count > MAX_PHOTOS:
             shutil.rmtree(job_dir, ignore_errors=True)
-            return jsonify(error=f'{count} photos is too many — please use {MAX_PHOTOS} or fewer.'), 400
+            return jsonify(error=f'{count} photos — max is {MAX_PHOTOS}.'), 400
 
-        set_job(job_id, 'queued', 0.0, f'Queued — {count} photos received')
+        set_job(job_id, 'queued', 0.0, f'Queued — {count} photos')
         enqueue_job(job_id, img_dir, job_dir)
         return jsonify(job_id=job_id, image_count=count), 202
 
     except Exception as e:
         logging.error(f'Submit failed: {traceback.format_exc()}')
-        return jsonify(error=f'Submit error: {type(e).__name__}: {str(e)}'), 500
+        return jsonify(error=f'{type(e).__name__}: {str(e)}'), 500
 
 
 @app.route('/status/<job_id>')
 def status(job_id):
     job = get_job(job_id)
     if not job:
-        obj = os.path.join(JOBS_DIR, job_id, 'result.obj')
-        if os.path.exists(obj):
-            return jsonify(status='done', progress=1.0,
-                           message='Complete', result_url=f'/result/{job_id}')
+        if os.path.exists(os.path.join(JOBS_DIR, job_id, f'{job_id}.zip')):
+            return jsonify(status='done', progress=1.0, message='Complete', result_url=f'/result/{job_id}')
         return jsonify(error='Job not found'), 404
     return jsonify(job)
 
 
 @app.route('/result/<job_id>')
 def result(job_id):
-    obj = os.path.join(JOBS_DIR, job_id, 'result.obj')
-    if not os.path.exists(obj):
+    zip_path = os.path.join(JOBS_DIR, job_id, f'{job_id}.zip')
+    if not os.path.exists(zip_path):
         return jsonify(error='Result not found'), 404
-    return send_file(obj, mimetype='text/plain',
-                     as_attachment=True, download_name='scan.obj')
+    return send_file(zip_path, mimetype='application/zip',
+                     as_attachment=True, download_name='scan.zip')
 
 
 if __name__ == '__main__':
