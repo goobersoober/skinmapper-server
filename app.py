@@ -29,8 +29,14 @@ def run_pipeline(job_id, image_dir, job_dir):
             logging.info(f'[{job_id[:8]}] Running: {" ".join(cmd[:3])}...')
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             if r.returncode != 0:
-                logging.error(f'[{job_id[:8]}] {msg} FAILED.\nstdout: {r.stdout[-500:]}\nstderr: {r.stderr[-500:]}')
-                raise RuntimeError(f'{msg} failed: {r.stderr[-800:]}')
+                err = r.stderr.strip() or r.stdout.strip() or '(no output)'
+                if r.returncode < 0:
+                    import signal
+                    sig = -r.returncode
+                    signame = signal.Signals(sig).name if sig in signal._value2member_map_ else str(sig)
+                    err = f'Process killed by signal {signame} (likely out of memory). {err}'
+                logging.error(f'[{job_id[:8]}] {msg} FAILED (code {r.returncode}).\nstdout: {r.stdout[-500:]}\nstderr: {r.stderr[-500:]}')
+                raise RuntimeError(f'{msg} failed (exit {r.returncode}): {err[:800]}')
             logging.info(f'[{job_id[:8]}] {msg} OK')
 
         # Verify images exist
