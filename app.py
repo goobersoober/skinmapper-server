@@ -79,9 +79,7 @@ def run_pipeline(job_id, image_dir, job_dir):
     try:
         db      = os.path.join(job_dir, 'db.db')
         sparse  = os.path.join(job_dir, 'sparse')
-        dense   = os.path.join(job_dir, 'dense')
         os.makedirs(sparse, exist_ok=True)
-        os.makedirs(dense,  exist_ok=True)
 
         def run(cmd, progress, msg):
             set_job(job_id, 'processing', progress, msg)
@@ -151,47 +149,34 @@ def run_pipeline(job_id, image_dir, job_dir):
             raise RuntimeError(
                 'Could not reconstruct — take more overlapping photos with slow, steady movement.')
 
-        # 4 — Undistort
-        run(['colmap', 'image_undistorter',
-             '--image_path', image_dir,
+        # 4 — Export sparse point cloud to PLY (no CUDA needed)
+        ply = os.path.join(job_dir, 'sparse.ply')
+        run(['colmap', 'model_converter',
              '--input_path', sparse0,
-             '--output_path', dense,
-             '--output_type', 'COLMAP',
-             '--max_image_size', str(MAX_DIM)],
-            0.50, 'Undistorting images…')
+             '--output_path', ply,
+             '--output_type', 'PLY'],
+            0.50, 'Exporting point cloud…')
 
-        # 5 — Depth maps (patch-match stereo)
-        run(['colmap', 'patch_match_stereo',
-             '--workspace_path', dense,
-             '--workspace_format', 'COLMAP',
-             '--PatchMatchStereo.geom_consistency', 'true',
-             '--PatchMatchStereo.max_image_size', str(MAX_DIM),
-             '--PatchMatchStereo.window_radius', '3',
-             '--PatchMatchStereo.num_iterations', '3'],
-            0.62, 'Computing depth maps…')
-
-        # 6 — Fuse into dense point cloud
-        ply = os.path.join(job_dir, 'dense.ply')
-        run(['colmap', 'stereo_fusion',
-             '--workspace_path', dense,
-             '--workspace_format', 'COLMAP',
-             '--input_type', 'geometric',
-             '--output_path', ply],
-            0.72, 'Fusing into point cloud…')
-
-        # 7 — Mesh with open3d
-        set_job(job_id, 'processing', 0.78, 'Building mesh…')
+        # 5 — Densify using multi-view stereo via open3d (CPU-based)
+        set_job(job_id, 'processing', 0.55, 'Building mesh…')
         import open3d as o3d
         import numpy as np
 
         pcd = o3d.io.read_point_cloud(ply)
         pts = len(pcd.points)
+        logging.info(f'[{tag}] Sparse point cloud: {pts} points')
+
+        # Remove statistical outliers
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        pts = len(pcd.points)
         logging.info(f'[{tag}] Point cloud: {pts} points')
 
-        if pts < 500:
+        if pts < 200:
             raise RuntimeError(
-                f'Only {pts} points reconstructed — not enough for a mesh. '
-                'Try taking more photos with more overlap.')
+                f'Only {pts} 3D points reconstructed — not enough for a mesh. '
+                'Try taking more photos with more overlap and steady movement.')
+
+        logging.info(f'[{tag}] After outlier removal: {pts} points')
 
         pcd.estimate_normals(
             search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
@@ -203,19 +188,33 @@ def run_pipeline(job_id, image_dir, job_dir):
             pcd = pcd.voxel_down_sample(voxel)
             logging.info(f'[{tag}] Downsampled to {len(pcd.points)} points')
 
-        set_job(job_id, 'processing', 0.83, 'Creating surface…')
-        poisson_depth = 8 if pts < 100000 else 9
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=poisson_depth)
+        set_job(job_id, 'processing', 0.65, 'Creating surface…')
 
-        # Remove low-density vertices (Poisson artifacts at edges)
-        densities = np.asarray(densities)
-        threshold = np.quantile(densities, 0.05)
-        vertices_to_remove = densities < threshold
-        mesh.remove_vertices_by_mask(vertices_to_remove)
+        # Use ball-pivoting for sparse clouds, Poisson for dense
+        if pts < 5000:
+            # Ball-pivoting works better with sparse point clouds
+            distances = pcd.compute_nearest_neighbor_distance()
+            avg_dist = np.mean(distances)
+            radii = [avg_dist * 1.5, avg_dist * 3.0, avg_dist * 6.0]
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+                pcd, o3d.utility.DoubleVector(radii))
+            logging.info(f'[{tag}] Ball-pivoting mesh: {len(mesh.triangles)} triangles')
+        else:
+            poisson_depth = 8 if pts < 100000 else 9
+            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                pcd, depth=poisson_depth)
+            # Remove low-density Poisson artifacts
+            densities = np.asarray(densities)
+            threshold = np.quantile(densities, 0.05)
+            mesh.remove_vertices_by_mask(densities < threshold)
+            logging.info(f'[{tag}] Poisson mesh: {len(mesh.triangles)} triangles')
+
+        if len(mesh.triangles) == 0:
+            raise RuntimeError('Mesh generation failed — try photos with more overlap.')
 
         target_faces = min(50000, len(mesh.triangles))
-        mesh = mesh.simplify_quadric_decimation(target_faces)
+        if len(mesh.triangles) > target_faces:
+            mesh = mesh.simplify_quadric_decimation(target_faces)
         mesh.compute_vertex_normals()
 
         set_job(job_id, 'processing', 0.90, 'Exporting mesh…')
@@ -245,11 +244,13 @@ def run_pipeline(job_id, image_dir, job_dir):
         set_job(job_id, 'error', 0, str(e), error=str(e))
     finally:
         # Clean up intermediate files, keep only the .usdz result
-        for d in [image_dir, sparse, dense]:
+        for d in [image_dir, sparse]:
             shutil.rmtree(d, ignore_errors=True)
-        for f in [db, os.path.join(job_dir, 'dense.ply'), obj_path if 'obj_path' in dir() else '']:
+        for f in [db, os.path.join(job_dir, 'sparse.ply')]:
             try: os.remove(f)
             except: pass
+        try: os.remove(os.path.join(job_dir, 'mesh.obj'))
+        except: pass
 
 
 # ── Routes ───────────────────────────────────────────────────────────
