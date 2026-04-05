@@ -31,10 +31,10 @@ def run_pipeline(job_id, image_dir, job_dir):
             if r.returncode != 0:
                 err = r.stderr.strip() or r.stdout.strip() or '(no output)'
                 if r.returncode < 0:
-                    import signal
                     sig = -r.returncode
-                    signame = signal.Signals(sig).name if sig in signal._value2member_map_ else str(sig)
-                    err = f'Process killed by signal {signame} (likely out of memory). {err}'
+                    signames = {9: 'SIGKILL (out of memory)', 11: 'SIGSEGV (crash)', 6: 'SIGABRT (abort)'}
+                    signame = signames.get(sig, f'signal {sig}')
+                    err = f'Process killed by {signame}. {err}'
                 logging.error(f'[{job_id[:8]}] {msg} FAILED (code {r.returncode}).\nstdout: {r.stdout[-500:]}\nstderr: {r.stderr[-500:]}')
                 raise RuntimeError(f'{msg} failed (exit {r.returncode}): {err[:800]}')
             logging.info(f'[{job_id[:8]}] {msg} OK')
