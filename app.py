@@ -45,14 +45,31 @@ def run_pipeline(job_id, image_dir, job_dir):
         if not imgs:
             raise RuntimeError('No valid images found in upload')
 
+        # Downscale images to fit in Railway memory
+        set_job(job_id, 'processing', 0.05, 'Resizing images for processing…')
+        from PIL import Image
+        MAX_DIM = 800
+        for fname in imgs:
+            fpath = os.path.join(image_dir, fname)
+            try:
+                with Image.open(fpath) as im:
+                    w, h = im.size
+                    if max(w, h) > MAX_DIM:
+                        scale = MAX_DIM / max(w, h)
+                        im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                        im.save(fpath, quality=85)
+                        logging.info(f'[{job_id[:8]}] Resized {fname}: {w}x{h} -> {im.size[0]}x{im.size[1]}')
+            except Exception as e:
+                logging.warning(f'[{job_id[:8]}] Could not resize {fname}: {e}')
+
         # 1 — Feature extraction
         run(['colmap', 'feature_extractor',
              '--database_path', db,
              '--image_path', image_dir,
              '--ImageReader.single_camera', '1',
              '--SiftExtraction.use_gpu', '0',
-             '--SiftExtraction.max_image_size', '1024',
-             '--SiftExtraction.max_num_features', '4096'],
+             '--SiftExtraction.max_image_size', '800',
+             '--SiftExtraction.max_num_features', '2048'],
             0.10, 'Extracting image features…')
 
         # 2 — Matching
