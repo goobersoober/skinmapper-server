@@ -2,6 +2,7 @@ import os, uuid, zipfile, subprocess, threading, json, shutil
 from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max upload
 JOBS_DIR = '/tmp/skinmapper_jobs'
 os.makedirs(JOBS_DIR, exist_ok=True)
 
@@ -126,6 +127,14 @@ def run_pipeline(job_id, image_dir, job_dir):
             try: os.remove(f)
             except: pass
 
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify(error='Upload too large. Please use fewer or smaller photos.'), 413
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify(error=f'Server error: {str(e)}'), 500
 
 @app.route('/health')
 def health():
