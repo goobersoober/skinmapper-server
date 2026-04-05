@@ -218,24 +218,11 @@ def run_pipeline(job_id, image_dir, job_dir):
         mesh.compute_vertex_normals()
 
         set_job(job_id, 'processing', 0.90, 'Exporting mesh…')
-        obj_path = os.path.join(job_dir, 'mesh.obj')
-        o3d.io.write_triangle_mesh(obj_path, mesh, write_ascii=False)
+        obj_path = os.path.join(job_dir, 'result.obj')
+        o3d.io.write_triangle_mesh(obj_path, mesh, write_ascii=True)
 
-        # 8 — Package as USDZ
-        set_job(job_id, 'processing', 0.95, 'Packaging result…')
-        usdz = os.path.join(job_dir, f'{job_id}.usdz')
-        with zipfile.ZipFile(usdz, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.write(obj_path, 'mesh.obj')
-            mtl = obj_path.replace('.obj', '.mtl')
-            if os.path.exists(mtl):
-                zf.write(mtl, 'mesh.mtl')
-            for ext in ['.png', '.jpg', '.jpeg']:
-                tex = obj_path.replace('.obj', ext)
-                if os.path.exists(tex):
-                    zf.write(tex, f'mesh{ext}')
-
-        result_size = os.path.getsize(usdz)
-        logging.info(f'[{tag}] Done! Result: {result_size} bytes, {len(mesh.triangles)} triangles')
+        result_size = os.path.getsize(obj_path)
+        logging.info(f'[{tag}] Done! OBJ: {result_size} bytes, {len(mesh.triangles)} triangles')
         set_job(job_id, 'done', 1.0, 'Reconstruction complete!',
                 result_url=f'/result/{job_id}')
 
@@ -249,8 +236,6 @@ def run_pipeline(job_id, image_dir, job_dir):
         for f in [db, os.path.join(job_dir, 'sparse.ply')]:
             try: os.remove(f)
             except: pass
-        try: os.remove(os.path.join(job_dir, 'mesh.obj'))
-        except: pass
 
 
 # ── Routes ───────────────────────────────────────────────────────────
@@ -345,8 +330,8 @@ def submit():
 def status(job_id):
     job = get_job(job_id)
     if not job:
-        usdz = os.path.join(JOBS_DIR, job_id, f'{job_id}.usdz')
-        if os.path.exists(usdz):
+        obj = os.path.join(JOBS_DIR, job_id, 'result.obj')
+        if os.path.exists(obj):
             return jsonify(status='done', progress=1.0,
                            message='Complete', result_url=f'/result/{job_id}')
         return jsonify(error='Job not found'), 404
@@ -355,11 +340,11 @@ def status(job_id):
 
 @app.route('/result/<job_id>')
 def result(job_id):
-    usdz = os.path.join(JOBS_DIR, job_id, f'{job_id}.usdz')
-    if not os.path.exists(usdz):
+    obj = os.path.join(JOBS_DIR, job_id, 'result.obj')
+    if not os.path.exists(obj):
         return jsonify(error='Result not found'), 404
-    return send_file(usdz, mimetype='model/vnd.usdz+zip',
-                     as_attachment=True, download_name='scan.usdz')
+    return send_file(obj, mimetype='text/plain',
+                     as_attachment=True, download_name='scan.obj')
 
 
 if __name__ == '__main__':
