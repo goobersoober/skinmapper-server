@@ -1,5 +1,7 @@
-import os, uuid, zipfile, subprocess, threading, json, shutil
+import os, uuid, zipfile, subprocess, threading, json, shutil, logging, traceback
 from flask import Flask, request, jsonify, send_file
+
+logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max upload
@@ -134,7 +136,15 @@ def too_large(e):
 
 @app.errorhandler(500)
 def server_error(e):
-    return jsonify(error=f'Server error: {str(e)}'), 500
+    original = getattr(e, 'original_exception', None)
+    msg = str(original) if original else str(e)
+    return jsonify(error=f'Server error: {msg}'), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    tb = traceback.format_exc()
+    return jsonify(error=f'{type(e).__name__}: {str(e)}', traceback=tb), 500
 
 @app.route('/health')
 def health():
@@ -149,32 +159,44 @@ def health():
 
 @app.route('/submit', methods=['POST'])
 def submit():
-    if 'photos' not in request.files:
-        return jsonify(error='No photos file'), 400
-    f = request.files['photos']
-    job_id  = str(uuid.uuid4())
-    job_dir = os.path.join(JOBS_DIR, job_id)
-    img_dir = os.path.join(job_dir, 'images')
-    os.makedirs(img_dir, exist_ok=True)
+    try:
+        logging.info(f'Submit request: content_length={request.content_length}, content_type={request.content_type}')
+        if 'photos' not in request.files:
+            logging.error(f'No photos field. Form keys: {list(request.files.keys())}')
+            return jsonify(error='No photos file'), 400
+        f = request.files['photos']
+        logging.info(f'Received file: {f.filename}, size approx {request.content_length}')
 
-    zip_path = os.path.join(job_dir, 'photos.zip')
-    f.save(zip_path)
-    with zipfile.ZipFile(zip_path) as zf:
-        for m in zf.namelist():
-            name = os.path.basename(m)
-            if name.lower().endswith(('.jpg','.jpeg','.png','.heic')):
-                with zf.open(m) as src, open(os.path.join(img_dir, name), 'wb') as dst:
-                    dst.write(src.read())
-    os.remove(zip_path)
+        job_id  = str(uuid.uuid4())
+        job_dir = os.path.join(JOBS_DIR, job_id)
+        img_dir = os.path.join(job_dir, 'images')
+        os.makedirs(img_dir, exist_ok=True)
 
-    count = len(os.listdir(img_dir))
-    if count < 10:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify(error=f'Only {count} images — need at least 10'), 400
+        zip_path = os.path.join(job_dir, 'photos.zip')
+        f.save(zip_path)
+        zip_size = os.path.getsize(zip_path)
+        logging.info(f'Saved zip: {zip_size} bytes')
 
-    set_job(job_id, 'queued', 0.0, f'Queued — {count} photos received')
-    threading.Thread(target=run_pipeline, args=(job_id, img_dir, job_dir), daemon=True).start()
-    return jsonify(job_id=job_id, image_count=count), 202
+        with zipfile.ZipFile(zip_path) as zf:
+            for m in zf.namelist():
+                name = os.path.basename(m)
+                if name.lower().endswith(('.jpg','.jpeg','.png','.heic')):
+                    with zf.open(m) as src, open(os.path.join(img_dir, name), 'wb') as dst:
+                        dst.write(src.read())
+        os.remove(zip_path)
+
+        count = len(os.listdir(img_dir))
+        logging.info(f'Extracted {count} images')
+        if count < 10:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            return jsonify(error=f'Only {count} images — need at least 10'), 400
+
+        set_job(job_id, 'queued', 0.0, f'Queued — {count} photos received')
+        threading.Thread(target=run_pipeline, args=(job_id, img_dir, job_dir), daemon=True).start()
+        return jsonify(job_id=job_id, image_count=count), 202
+    except Exception as e:
+        logging.error(f'Submit failed: {traceback.format_exc()}')
+        return jsonify(error=f'Submit error: {type(e).__name__}: {str(e)}'), 500
 
 
 @app.route('/status/<job_id>')
