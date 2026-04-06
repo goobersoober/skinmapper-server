@@ -252,6 +252,15 @@ def run_pipeline(job_id, image_dir, job_dir):
         vertices = np.asarray(mesh.vertices)
         triangles = np.asarray(mesh.triangles)
 
+        # Normalize mesh to real-world scale (~0.35m longest axis = typical limb)
+        bbox = vertices.max(axis=0) - vertices.min(axis=0)
+        current_size = bbox.max()
+        if current_size > 0:
+            target_size = 0.35  # 35cm in meters
+            scale = target_size / current_size
+            vertices = vertices * scale
+            logging.info(f'[{tag}] Normalized mesh: scale={scale:.4f}, bbox was {bbox}, now {bbox*scale}')
+
         center = vertices.mean(axis=0)
         centered = vertices - center
         cov = np.cov(centered.T)
