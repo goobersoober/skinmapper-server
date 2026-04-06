@@ -292,7 +292,7 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         # Zip it all up
         zip_path = os.path.join(job_dir, f'{job_id}.zip')
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
             zf.write(obj_path, 'mesh.obj')
             zf.write(mtl_path, 'mesh.mtl')
             if os.path.exists(tex_path):
