@@ -249,20 +249,12 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         # 8 — UV unwrap (cylindrical)
         set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
-        vertices = np.asarray(mesh.vertices)
+        vertices_original = np.asarray(mesh.vertices)  # COLMAP coordinates — for texture baking
         triangles = np.asarray(mesh.triangles)
 
-        # Normalize mesh to real-world scale (~0.35m longest axis = typical limb)
-        bbox = vertices.max(axis=0) - vertices.min(axis=0)
-        current_size = bbox.max()
-        if current_size > 0:
-            target_size = 0.35  # 35cm in meters
-            scale = target_size / current_size
-            vertices = vertices * scale
-            logging.info(f'[{tag}] Normalized mesh: scale={scale:.4f}, bbox was {bbox}, now {bbox*scale}')
-
-        center = vertices.mean(axis=0)
-        centered = vertices - center
+        # UV unwrap uses original coordinates (scale doesn't affect UVs)
+        center = vertices_original.mean(axis=0)
+        centered = vertices_original - center
         cov = np.cov(centered.T)
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
         axis = eigenvectors[:, np.argmax(eigenvalues)]
@@ -279,12 +271,23 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         uvs = np.column_stack([u, v])
 
-        # 9 — Bake texture from photos
+        # 9 — Bake texture from photos (must use original COLMAP coordinates for projection)
         set_job(job_id, 'processing', 0.80, 'Baking skin texture…')
         texture = bake_texture(
-            vertices, triangles, uvs, sparse0,
+            vertices_original, triangles, uvs, sparse0,
             os.path.join(dense, 'images'), tag
         )
+
+        # Normalize mesh to real-world scale (~0.35m longest axis = typical limb)
+        bbox = vertices_original.max(axis=0) - vertices_original.min(axis=0)
+        current_size = bbox.max()
+        if current_size > 0:
+            target_size = 0.35  # 35cm in meters
+            scale = target_size / current_size
+            vertices = vertices_original * scale
+            logging.info(f'[{tag}] Normalized mesh: scale={scale:.4f}, bbox was {bbox}, now {bbox*scale}')
+        else:
+            vertices = vertices_original
 
         # 10 — Export OBJ + MTL + texture as zip
         set_job(job_id, 'processing', 0.92, 'Packaging result…')
@@ -338,6 +341,10 @@ def bake_texture(vertices, triangles, uvs, sparse_path, image_dir, tag, tex_size
             logging.warning(f'[{tag}] No camera data — skipping texture')
             return None
 
+        logging.info(f'[{tag}] Baking: {len(cameras)} cameras, {len(images_meta)} images, {len(vertices)} verts, {len(triangles)} tris')
+        for cid, cam in cameras.items():
+            logging.info(f'[{tag}]   Camera {cid}: model={cam.get("model_id","?")} w={cam["w"]} h={cam["h"]} params={cam["params"][:4]}...')
+
         tex = Image.new('RGB', (tex_size, tex_size), (180, 144, 120))
         tex_arr = np.array(tex)
         weight_buf = np.zeros((tex_size, tex_size), dtype=np.float32)
@@ -357,7 +364,23 @@ def bake_texture(vertices, triangles, uvs, sparse_path, image_dir, tag, tex_size
             except:
                 continue
 
-            fx, fy, cx, cy = cam['params'][:4]
+            # Extract fx, fy, cx, cy based on COLMAP camera model
+            model_id = cam.get('model_id', 1)
+            params = cam['params']
+            if model_id == 0:  # SIMPLE_PINHOLE: f, cx, cy
+                fx = fy = params[0]; cx = params[1]; cy = params[2]
+            elif model_id == 1:  # PINHOLE: fx, fy, cx, cy
+                fx = params[0]; fy = params[1]; cx = params[2]; cy = params[3]
+            elif model_id == 2:  # SIMPLE_RADIAL: f, cx, cy, k
+                fx = fy = params[0]; cx = params[1]; cy = params[2]
+            elif model_id == 3:  # RADIAL: f, cx, cy, k1, k2
+                fx = fy = params[0]; cx = params[1]; cy = params[2]
+            elif model_id == 4:  # OPENCV: fx, fy, cx, cy, k1, k2, p1, p2
+                fx = params[0]; fy = params[1]; cx = params[2]; cy = params[3]
+            else:  # Default: try as PINHOLE
+                fx = params[0]; fy = params[1] if len(params) > 3 else params[0]
+                cx = params[2] if len(params) > 3 else params[1]
+                cy = params[3] if len(params) > 3 else params[2]
             R = img_data['R']
             t = img_data['t']
 
@@ -368,6 +391,13 @@ def bake_texture(vertices, triangles, uvs, sparse_path, image_dir, tag, tex_size
             px = (fx * cam_pts[:, 0] / cam_pts[:, 2] + cx)
             py = (fy * cam_pts[:, 1] / cam_pts[:, 2] + cy)
             depths = cam_pts[:, 2]
+
+            # Log projection stats for debugging
+            in_frame = (px >= 0) & (px < pw) & (py >= 0) & (py < ph) & valid
+            logging.info(f'[{tag}]   {img_data["name"]}: {in_frame.sum()}/{len(vertices)} verts in frame, '
+                        f'fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}, '
+                        f'px range=[{px[valid].min():.0f},{px[valid].max():.0f}] '
+                        f'py range=[{py[valid].min():.0f},{py[valid].max():.0f}]')
 
             # For each triangle, check if all 3 vertices project into this view
             for tri in triangles:
@@ -436,7 +466,7 @@ def read_colmap_cameras_bin(path):
             np_map = {0:3, 1:4, 2:4, 3:5, 4:4, 5:5}
             num_p = np_map.get(model_id, 4)
             params = struct.unpack(f'<{num_p}d', f.read(8*num_p))
-            cameras[cam_id] = {'w': w, 'h': h, 'params': params}
+            cameras[cam_id] = {'w': w, 'h': h, 'params': params, 'model_id': model_id}
     return cameras
 
 
