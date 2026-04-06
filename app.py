@@ -102,12 +102,31 @@ def run_pipeline(job_id, image_dir, job_dir):
             set_job(job_id, 'processing', progress, msg)
             logging.info(f'[{tag}] {msg}')
             t0 = time.time()
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            # Run subprocess non-blocking so we can keep job timestamp fresh
+            # Use separate thread to drain stderr to avoid pipe deadlock
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            stderr_lines = []
+            def drain_stderr():
+                for line in proc.stderr:
+                    stderr_lines.append(line)
+            drain_thread = threading.Thread(target=drain_stderr, daemon=True)
+            drain_thread.start()
+            while True:
+                try:
+                    proc.wait(timeout=10)
+                    break
+                except subprocess.TimeoutExpired:
+                    elapsed_so_far = time.time() - t0
+                    set_job(job_id, 'processing', progress, f'{msg} ({int(elapsed_so_far)}s)')
+                    if elapsed_so_far > 900:
+                        proc.kill()
+                        raise RuntimeError(f'{msg} timed out after 15 minutes')
+            drain_thread.join(timeout=5)
             elapsed = time.time() - t0
-            if r.returncode != 0:
-                err = r.stderr.strip() or r.stdout.strip() or '(no output)'
-                if r.returncode < 0:
-                    sig = -r.returncode
+            if proc.returncode != 0:
+                err = ''.join(stderr_lines).strip() or '(no output)'
+                if proc.returncode < 0:
+                    sig = -proc.returncode
                     signames = {9: 'SIGKILL (out of memory)', 11: 'SIGSEGV (crash)', 6: 'SIGABRT (abort)'}
                     signame = signames.get(sig, f'signal {sig}')
                     err = f'Process killed by {signame}. {err}'
@@ -188,7 +207,9 @@ def run_pipeline(job_id, image_dir, job_dir):
              '--workspace_path', dense,
              '--workspace_format', 'COLMAP',
              '--input_type', 'geometric',
-             '--output_path', ply_path],
+             '--output_path', ply_path,
+             '--StereoFusion.max_image_size', '1200',
+             '--StereoFusion.min_num_pixels', '5'],
             0.62, 'Fusing point cloud…')
 
         # 7 — Mesh with open3d
@@ -485,7 +506,7 @@ def health():
     with lock:
         q, a = len(queue), active_count
     return jsonify(status='ok', colmap=colmap_ok, open3d=o3d_ok, gpu=HAS_GPU,
-                   gpu_name=GPU_NAME, version='3.0.0', active_jobs=a, queued_jobs=q)
+                   gpu_name=GPU_NAME, version='3.1.0', active_jobs=a, queued_jobs=q)
 
 
 @app.route('/submit', methods=['POST'])
@@ -551,6 +572,19 @@ def result(job_id):
         return jsonify(error='Result not found'), 404
     return send_file(zip_path, mimetype='application/zip',
                      as_attachment=True, download_name='scan.zip')
+
+
+@app.route('/logs')
+def logs():
+    """View recent server logs for debugging."""
+    log_path = os.environ.get('LOG_FILE', '/workspace/server.log')
+    try:
+        with open(log_path) as f:
+            lines = f.readlines()
+        last = lines[-200:] if len(lines) > 200 else lines
+        return '<pre>' + ''.join(last) + '</pre>', 200, {'Content-Type': 'text/html'}
+    except:
+        return 'No log file found', 404
 
 
 if __name__ == '__main__':
