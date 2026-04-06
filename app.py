@@ -136,20 +136,20 @@ def run_pipeline(job_id, image_dir, job_dir):
             except Exception as e:
                 logging.warning(f'[{tag}] Resize {fname}: {e}')
 
-        # 1 — Feature extraction
+        # 1 — Feature extraction (CPU — COLMAP's SiftGPU needs OpenGL display)
         run(['colmap', 'feature_extractor',
              '--database_path', db,
              '--image_path', image_dir,
              '--ImageReader.single_camera', '1',
-             '--SiftExtraction.use_gpu', use_gpu,
+             '--SiftExtraction.use_gpu', '0',
              '--SiftExtraction.max_image_size', str(MAX_DIM),
              '--SiftExtraction.max_num_features', '8192'],
             0.08, 'Extracting features…')
 
-        # 2 — Matching
+        # 2 — Matching (CPU — same OpenGL issue)
         run(['colmap', 'exhaustive_matcher',
              '--database_path', db,
-             '--SiftMatching.use_gpu', use_gpu],
+             '--SiftMatching.use_gpu', '0'],
             0.18, 'Matching features…')
 
         # 3 — Sparse reconstruction
