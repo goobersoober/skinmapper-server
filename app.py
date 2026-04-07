@@ -212,120 +212,154 @@ def run_pipeline(job_id, image_dir, job_dir):
              '--StereoFusion.min_num_pixels', '5'],
             0.62, 'Fusing point cloud…')
 
-        # 7 — Mesh with open3d
-        set_job(job_id, 'processing', 0.66, 'Building mesh…')
+        # ═══════════════════════════════════════════════════════════════
+        # PHASE 2 — Point cloud → textured mesh (xatlas + vertex colors)
+        # ═══════════════════════════════════════════════════════════════
+
+        set_job(job_id, 'processing', 0.66, 'Loading point cloud…')
         import open3d as o3d
         import numpy as np
+        import trimesh
+        import xatlas
+        import cv2
         from scipy.spatial import cKDTree
 
         pcd = o3d.io.read_point_cloud(ply_path)
         pts = len(pcd.points)
         has_colors = pcd.has_colors()
         logging.info(f'[{tag}] Dense cloud: {pts} points, has_colors={has_colors}')
-
         if pts < 500:
             raise RuntimeError(f'Only {pts} points — take more overlapping photos.')
 
-        # Clean outliers (fast)
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        # ── Step 7: Clean point cloud ────────────────────────────────
+        set_job(job_id, 'processing', 0.68, 'Cleaning point cloud…')
+
+        # Statistical outlier removal
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=1.5)
+        # Radius outlier removal (removes isolated clusters)
+        pcd, _ = pcd.remove_radius_outlier(nb_points=16, radius=0.05)
         logging.info(f'[{tag}] After outlier removal: {len(pcd.points)} points')
 
-        # Save point cloud colors before meshing
-        pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
-        pcd_points_arr = np.asarray(pcd.points)
-        logging.info(f'[{tag}] Point cloud colors: {pcd_colors is not None}')
+        # Downsample for speed (preserves colors)
+        if len(pcd.points) > 200000:
+            pcd = pcd.voxel_down_sample(0.003)
+            logging.info(f'[{tag}] After voxel downsample: {len(pcd.points)} points')
 
-        # Downsample if huge (keeps colors)
-        if len(pcd.points) > 300000:
-            pcd = pcd.voxel_down_sample(0.002)
-            pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
-            pcd_points_arr = np.asarray(pcd.points)
-            logging.info(f'[{tag}] After downsample: {len(pcd.points)} points')
+        # DBSCAN: keep only the largest cluster (body part vs background)
+        pts_arr = np.asarray(pcd.points)
+        nn_dists = np.asarray(pcd.compute_nearest_neighbor_distance())
+        eps = np.median(nn_dists) * 5
+        labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=20, print_progress=False))
+        if labels.max() >= 0:
+            counts = np.bincount(labels[labels >= 0])
+            largest = np.argmax(counts)
+            pcd = pcd.select_by_index(np.where(labels == largest)[0])
+            logging.info(f'[{tag}] Largest cluster: {len(pcd.points)} pts ({len(counts)} clusters)')
+
+        # Save colors for later
+        pcd_points = np.asarray(pcd.points)
+        pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
+
+        # ── Step 8: Surface reconstruction ───────────────────────────
+        set_job(job_id, 'processing', 0.72, 'Creating surface…')
 
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30))
-        pcd.orient_normals_consistent_tangent_plane(50)
+        pcd.orient_normals_consistent_tangent_plane(30)
 
-        set_job(job_id, 'processing', 0.72, 'Creating surface…')
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
-        densities = np.asarray(densities)
-        mesh.remove_vertices_by_mask(densities < np.quantile(densities, 0.05))
+        # Ball-pivoting: only creates triangles where points exist
+        nn_dists = np.asarray(pcd.compute_nearest_neighbor_distance())
+        avg_dist = np.mean(nn_dists)
+        radii = [avg_dist * 1.5, avg_dist * 3, avg_dist * 6]
+        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+            pcd, o3d.utility.DoubleVector(radii))
+        logging.info(f'[{tag}] Ball-pivot: {len(mesh.vertices)} verts, {len(mesh.triangles)} tris')
 
-        target = min(50000, len(mesh.triangles))
-        if len(mesh.triangles) > target:
-            mesh = mesh.simplify_quadric_decimation(target)
+        # Fallback to Poisson if ball-pivoting produces too little
+        if len(mesh.triangles) < 500:
+            logging.info(f'[{tag}] Ball-pivot insufficient, using Poisson')
+            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
+            densities = np.asarray(densities)
+            # Aggressive trim: remove bottom 15% by density (phantom surfaces)
+            mesh.remove_vertices_by_mask(densities < np.quantile(densities, 0.15))
+
+        # Remove small disconnected pieces
+        tri_clusters, tri_counts, _ = mesh.cluster_connected_triangles()
+        tri_clusters = np.asarray(tri_clusters)
+        tri_counts = np.asarray(tri_counts)
+        if len(tri_counts) > 1:
+            keep = tri_clusters == tri_counts.argmax()
+            mesh.remove_triangles_by_mask(~keep)
+            mesh.remove_unreferenced_vertices()
+            logging.info(f'[{tag}] Kept largest component: {len(mesh.triangles)} tris')
+
+        # Decimate to reasonable size
+        target_tris = min(50000, len(mesh.triangles))
+        if len(mesh.triangles) > target_tris:
+            mesh = mesh.simplify_quadric_decimation(target_tris)
         mesh.compute_vertex_normals()
 
-        logging.info(f'[{tag}] Mesh: {len(mesh.vertices)} verts, {len(mesh.triangles)} tris')
-        if len(mesh.triangles) == 0:
+        verts = np.asarray(mesh.vertices).astype(np.float32)
+        faces = np.asarray(mesh.triangles).astype(np.uint32)
+        logging.info(f'[{tag}] Final mesh: {len(verts)} verts, {len(faces)} tris')
+        if len(faces) == 0:
             raise RuntimeError('Mesh generation failed — try more overlapping photos.')
 
-        # 8 — Transfer point cloud colors to mesh vertices (vectorized with scipy)
+        # ── Step 9: Transfer vertex colors from point cloud ──────────
         set_job(job_id, 'processing', 0.76, 'Coloring mesh…')
-        vertices = np.asarray(mesh.vertices)
-        triangles = np.asarray(mesh.triangles)
 
-        vertex_colors = None
         if pcd_colors is not None and len(pcd_colors) > 0:
-            tree = cKDTree(pcd_points_arr)
-            _, idx = tree.query(vertices, k=3)
-            vertex_colors = pcd_colors[idx].mean(axis=1)  # avg of 3 nearest
-            logging.info(f'[{tag}] Vertex colors transferred: min={vertex_colors.min():.3f} max={vertex_colors.max():.3f}')
+            tree = cKDTree(pcd_points)
+            _, idx = tree.query(verts, k=3)
+            vertex_colors = (pcd_colors[idx].mean(axis=1) * 255).clip(0, 255).astype(np.uint8)
+            logging.info(f'[{tag}] Vertex colors: shape={vertex_colors.shape}')
+        else:
+            vertex_colors = np.full((len(verts), 3), 180, dtype=np.uint8)
+            logging.warning(f'[{tag}] No point cloud colors — using placeholder')
 
-        # 9 — UV unwrap (cylindrical)
-        set_job(job_id, 'processing', 0.78, 'UV unwrapping…')
-        center = vertices.mean(axis=0)
-        centered = vertices - center
-        cov = np.cov(centered.T)
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        axis = eigenvectors[:, np.argmax(eigenvalues)]
-        ref = eigenvectors[:, np.argsort(eigenvalues)[-2]]
+        # ── Step 10: UV unwrap with xatlas (no overlapping UVs) ──────
+        set_job(job_id, 'processing', 0.80, 'UV unwrapping (xatlas)…')
 
-        along = centered @ axis
-        radial = centered - np.outer(along, axis)
-        u = np.arctan2(np.sum(radial * np.cross(axis, ref), axis=1),
-                        np.sum(radial * ref, axis=1))
-        u = (u + np.pi) / (2 * np.pi)
+        vmapping, new_faces, uvs = xatlas.parametrize(verts, faces)
+        # xatlas splits vertices at seams → remap colors
+        new_verts = verts[vmapping]
+        new_colors = vertex_colors[vmapping]
+        logging.info(f'[{tag}] xatlas: {len(new_verts)} verts, {len(new_faces)} tris, '
+                     f'UV range u=[{uvs[:,0].min():.3f},{uvs[:,0].max():.3f}] '
+                     f'v=[{uvs[:,1].min():.3f},{uvs[:,1].max():.3f}]')
 
-        v_min, v_max = along.min(), along.max()
-        v = (along - v_min) / max(v_max - v_min, 1e-6)
-
-        uvs = np.column_stack([u, v])
-
-        # 10 — Bake texture by rasterizing colored triangles into UV space
-        set_job(job_id, 'processing', 0.82, 'Baking skin texture…')
-        texture = bake_texture_from_vertex_colors(
-            vertices, triangles, uvs, vertex_colors, tag
+        # ── Step 11: Bake vertex colors → texture via rasterization ──
+        set_job(job_id, 'processing', 0.85, 'Baking texture…')
+        TEX_SIZE = 2048
+        texture = bake_vertex_colors_to_texture(
+            new_verts, new_faces, uvs, new_colors, TEX_SIZE, tag
         )
 
-        # Normalize mesh to real-world scale (~0.35m longest axis = typical limb)
-        bbox = vertices.max(axis=0) - vertices.min(axis=0)
-        current_size = bbox.max()
-        if current_size > 0:
-            target_size = 0.35  # 35cm in meters
-            scale = target_size / current_size
-            vertices = vertices * scale
-            logging.info(f'[{tag}] Normalized mesh: scale={scale:.4f}, bbox was {bbox}, now {bbox*scale}')
-
-        # 10 — Export OBJ + MTL + texture as zip
+        # ── Step 12: Normalize scale + export ────────────────────────
         set_job(job_id, 'processing', 0.92, 'Packaging result…')
+
+        # Normalize to real-world scale (~0.35m longest axis)
+        bbox = new_verts.max(axis=0) - new_verts.min(axis=0)
+        max_dim = bbox.max()
+        if max_dim > 0:
+            scale = 0.35 / max_dim
+            new_verts = new_verts * scale
+            logging.info(f'[{tag}] Normalized: scale={scale:.4f}')
+
         result_dir = os.path.join(job_dir, 'result')
         os.makedirs(result_dir, exist_ok=True)
 
         tex_path = os.path.join(result_dir, 'mesh.png')
-        if texture is not None:
-            texture.save(tex_path)
+        texture.save(tex_path)
 
         obj_path = os.path.join(result_dir, 'mesh.obj')
         mtl_path = os.path.join(result_dir, 'mesh.mtl')
-        write_obj(vertices, triangles, uvs, obj_path, mtl_path, os.path.exists(tex_path))
+        write_obj(new_verts, new_faces, uvs, obj_path, mtl_path)
 
-        # Zip it all up
         zip_path = os.path.join(job_dir, f'{job_id}.zip')
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
             zf.write(obj_path, 'mesh.obj')
             zf.write(mtl_path, 'mesh.mtl')
-            if os.path.exists(tex_path):
-                zf.write(tex_path, 'mesh.png')
+            zf.write(tex_path, 'mesh.png')
 
         result_size = os.path.getsize(zip_path)
         logging.info(f'[{tag}] Done! {len(mesh.vertices)} verts, {len(mesh.triangles)} tris, zip={result_size} bytes')
@@ -343,150 +377,128 @@ def run_pipeline(job_id, image_dir, job_dir):
             except: pass
 
 
-# ── Texture baking from vertex colors ────────────────────────────────
+# ── Texture baking (vertex colors → UV texture via rasterization) ────
 
-def bake_texture_from_vertex_colors(vertices, triangles, uvs, vertex_colors, tag, tex_size=2048):
-    """Rasterize vertex colors into UV texture space — fast vectorized version."""
+def bake_vertex_colors_to_texture(verts, faces, uvs, colors, tex_size, tag):
+    """
+    Rasterize per-vertex colors into a UV texture map.
+    Uses OpenCV for scanline triangle rasterization (fast) + inpainting (fills gaps).
+    """
     import numpy as np
-    from PIL import Image, ImageFilter
+    import cv2
+    from PIL import Image
 
     try:
-        if vertex_colors is None:
-            logging.warning(f'[{tag}] No vertex colors — returning skin-tone texture')
-            return Image.fromarray(np.full((tex_size, tex_size, 3), 180, dtype=np.uint8))
+        tex = np.full((tex_size, tex_size, 3), 0, dtype=np.uint8)
+        mask = np.zeros((tex_size, tex_size), dtype=np.uint8)
 
-        colors_255 = (vertex_colors * 255).clip(0, 255).astype(np.float32)
+        # Convert UVs to pixel coords (xatlas UVs are already 0-1 normalized)
+        uv_px = uvs.copy()
+        uv_px[:, 0] = (uvs[:, 0] * (tex_size - 1)).clip(0, tex_size - 1)
+        uv_px[:, 1] = ((1 - uvs[:, 1]) * (tex_size - 1)).clip(0, tex_size - 1)
+        uv_px = uv_px.astype(np.int32)
 
-        # For each vertex, paint its color at its UV position (fast scatter)
-        tex_arr = np.full((tex_size, tex_size, 3), 0, dtype=np.float32)
-        weight_buf = np.zeros((tex_size, tex_size), dtype=np.float32)
+        logging.info(f'[{tag}] Rasterizing {len(faces)} triangles via OpenCV fillPoly...')
 
-        # Convert UVs to pixel coords
-        px_all = (uvs[:, 0] * (tex_size - 1)).astype(np.int32).clip(0, tex_size-1)
-        py_all = ((1 - uvs[:, 1]) * (tex_size - 1)).astype(np.int32).clip(0, tex_size-1)
+        # Rasterize each triangle with interpolated vertex colors
+        for tri in faces:
+            v0, v1, v2 = tri
+            p0 = uv_px[v0]; p1 = uv_px[v1]; p2 = uv_px[v2]
+            c0 = colors[v0].astype(np.float32)
+            c1 = colors[v1].astype(np.float32)
+            c2 = colors[v2].astype(np.float32)
 
-        # Paint every vertex
-        for i in range(len(vertices)):
-            x, y = px_all[i], py_all[i]
-            tex_arr[y, x] = colors_255[i]
-            weight_buf[y, x] = 1.0
+            # Bounding box
+            min_x = max(0, min(p0[0], p1[0], p2[0]))
+            max_x = min(tex_size-1, max(p0[0], p1[0], p2[0]))
+            min_y = max(0, min(p0[1], p1[1], p2[1]))
+            max_y = min(tex_size-1, max(p0[1], p1[1], p2[1]))
 
-        # Also paint along triangle edges for better coverage
-        logging.info(f'[{tag}] Painting {len(triangles)} triangle edges...')
-        for tri in triangles:
-            for e in [(0,1), (1,2), (2,0)]:
-                i0, i1 = tri[e[0]], tri[e[1]]
-                x0, y0 = px_all[i0], py_all[i0]
-                x1, y1 = px_all[i1], py_all[i1]
-                c0, c1 = colors_255[i0], colors_255[i1]
-                # Skip seam-wrapping edges
-                if abs(x1-x0) > tex_size // 2:
-                    continue
-                steps = max(abs(x1-x0), abs(y1-y0), 1)
-                if steps > 500:
-                    continue
-                for s in range(steps + 1):
-                    t = s / max(steps, 1)
-                    x = int(x0 + (x1-x0) * t)
-                    y = int(y0 + (y1-y0) * t)
-                    if 0 <= x < tex_size and 0 <= y < tex_size:
-                        color = c0 * (1-t) + c1 * t
-                        tex_arr[y, x] = color
-                        weight_buf[y, x] = 1.0
+            # Skip degenerate
+            if max_x - min_x < 1 and max_y - min_y < 1:
+                continue
 
-        painted_pct = (weight_buf > 0).sum() / weight_buf.size * 100
-        logging.info(f'[{tag}] After edge painting: {painted_pct:.1f}% covered')
+            # Use OpenCV to create triangle mask for this region
+            pts = np.array([[p0[0], p0[1]], [p1[0], p1[1]], [p2[0], p2[1]]], dtype=np.int32)
 
-        # Heavy dilation to fill interior of triangles and gaps
-        result = Image.fromarray(tex_arr.clip(0, 255).astype(np.uint8))
-        mask = weight_buf > 0
+            # For small triangles, just fill with average color
+            area = abs((p1[0]-p0[0])*(p2[1]-p0[1]) - (p2[0]-p0[0])*(p1[1]-p0[1]))
+            if area < 4:
+                avg_color = ((c0 + c1 + c2) / 3).clip(0, 255).astype(np.uint8)
+                cv2.fillConvexPoly(tex, pts, avg_color.tolist())
+                cv2.fillConvexPoly(mask, pts, 255)
+                continue
 
-        # Iterative gap fill: blur and fill unpainted regions
-        for i in range(30):
-            result_arr = np.array(result).astype(np.float32)
-            blurred = np.array(result.filter(ImageFilter.BoxBlur(3))).astype(np.float32)
-            blurred_mask = np.array(Image.fromarray((mask * 255).astype(np.uint8)).filter(ImageFilter.BoxBlur(3))).astype(np.float32) / 255.0
-            # Fill unpainted pixels with blurred values
-            unpainted = ~mask
-            for c in range(3):
-                result_arr[:,:,c] = np.where(unpainted, blurred[:,:,c], result_arr[:,:,c])
-            mask = mask | (blurred_mask > 0.1)
-            result = Image.fromarray(result_arr.clip(0, 255).astype(np.uint8))
+            # For larger triangles, use barycentric interpolation
+            # Create sub-image for this triangle's bbox
+            h = max_y - min_y + 1
+            w = max_x - min_x + 1
+            if h > 500 or w > 500:
+                continue  # skip anomalous
 
-        filled_pct = mask.sum() / mask.size * 100
-        logging.info(f'[{tag}] Texture: {filled_pct:.1f}% filled after dilation')
+            # Shift points to local coords
+            lp0 = [p0[0]-min_x, p0[1]-min_y]
+            lp1 = [p1[0]-min_x, p1[1]-min_y]
+            lp2 = [p2[0]-min_x, p2[1]-min_y]
 
-        return result
+            # Create meshgrid for barycentric
+            ys, xs = np.mgrid[0:h, 0:w]
+            denom = (lp1[1]-lp2[1])*(lp0[0]-lp2[0]) + (lp2[0]-lp1[0])*(lp0[1]-lp2[1])
+            if abs(denom) < 1e-6:
+                avg_color = ((c0 + c1 + c2) / 3).clip(0, 255).astype(np.uint8)
+                cv2.fillConvexPoly(tex, pts, avg_color.tolist())
+                cv2.fillConvexPoly(mask, pts, 255)
+                continue
+
+            w0 = ((lp1[1]-lp2[1])*(xs-lp2[0]) + (lp2[0]-lp1[0])*(ys-lp2[1])) / denom
+            w1 = ((lp2[1]-lp0[1])*(xs-lp2[0]) + (lp0[0]-lp2[0])*(ys-lp2[1])) / denom
+            w2 = 1.0 - w0 - w1
+
+            inside = (w0 >= -0.01) & (w1 >= -0.01) & (w2 >= -0.01)
+
+            if inside.any():
+                for ch in range(3):
+                    color_ch = (w0 * c0[ch] + w1 * c1[ch] + w2 * c2[ch]).clip(0, 255)
+                    tex[min_y:max_y+1, min_x:max_x+1, ch][inside] = color_ch[inside].astype(np.uint8)
+                mask[min_y:max_y+1, min_x:max_x+1][inside] = 255
+
+        painted_pct = (mask > 0).sum() / mask.size * 100
+        logging.info(f'[{tag}] Rasterized: {painted_pct:.1f}% painted')
+
+        # Inpaint unpainted regions using OpenCV TELEA algorithm
+        if painted_pct < 99:
+            inpaint_mask = (255 - mask).astype(np.uint8)
+            tex = cv2.inpaint(tex, inpaint_mask, 8, cv2.INPAINT_TELEA)
+            logging.info(f'[{tag}] Inpainted gaps')
+
+        # Convert BGR→RGB if needed (OpenCV uses BGR)
+        # Actually our array is already RGB, so just save
+        return Image.fromarray(tex)
 
     except Exception as e:
         logging.error(f'[{tag}] Texture bake failed: {traceback.format_exc()}')
-        return None
-
-
-# ── COLMAP binary readers ────────────────────────────────────────────
-
-def read_colmap_cameras_bin(path):
-    cameras = {}
-    if not os.path.exists(path):
-        return cameras
-    with open(path, 'rb') as f:
-        n = struct.unpack('<Q', f.read(8))[0]
-        for _ in range(n):
-            cam_id = struct.unpack('<I', f.read(4))[0]
-            model_id = struct.unpack('<i', f.read(4))[0]
-            w = struct.unpack('<Q', f.read(8))[0]
-            h = struct.unpack('<Q', f.read(8))[0]
-            np_map = {0:3, 1:4, 2:4, 3:5, 4:4, 5:5}
-            num_p = np_map.get(model_id, 4)
-            params = struct.unpack(f'<{num_p}d', f.read(8*num_p))
-            cameras[cam_id] = {'w': w, 'h': h, 'params': params, 'model_id': model_id}
-    return cameras
-
-
-def read_colmap_images_bin(path):
-    import numpy as np
-    images = {}
-    if not os.path.exists(path):
-        return images
-    with open(path, 'rb') as f:
-        n = struct.unpack('<Q', f.read(8))[0]
-        for _ in range(n):
-            img_id = struct.unpack('<I', f.read(4))[0]
-            qw, qx, qy, qz = struct.unpack('<4d', f.read(32))
-            tx, ty, tz = struct.unpack('<3d', f.read(24))
-            cam_id = struct.unpack('<I', f.read(4))[0]
-            name = b''
-            while True:
-                c = f.read(1)
-                if c == b'\x00': break
-                name += c
-            num_pts = struct.unpack('<Q', f.read(8))[0]
-            f.read(num_pts * 24)
-            # Quaternion to rotation matrix
-            R = np.array([
-                [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
-                [2*(qx*qy+qz*qw), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
-                [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1-2*(qx*qx+qy*qy)]
-            ])
-            images[img_id] = {'name': name.decode(), 'camera_id': cam_id, 'R': R, 't': np.array([tx,ty,tz])}
-    return images
+        return Image.fromarray(np.full((tex_size, tex_size, 3), 180, dtype=np.uint8))
 
 
 # ── OBJ writer ───────────────────────────────────────────────────────
 
-def write_obj(vertices, triangles, uvs, obj_path, mtl_path, has_texture):
+def write_obj(verts, faces, uvs, obj_path, mtl_path):
+    """Write OBJ + MTL with texture reference."""
     with open(mtl_path, 'w') as f:
-        f.write("newmtl skin\nKa 0.2 0.2 0.2\nKd 0.8 0.8 0.8\nKs 0.0 0.0 0.0\n")
-        if has_texture:
-            f.write("map_Kd mesh.png\n")
+        f.write("newmtl skin\n")
+        f.write("Ka 1.0 1.0 1.0\nKd 1.0 1.0 1.0\nKs 0.0 0.0 0.0\n")
+        f.write("d 1.0\nillum 1\n")
+        f.write("map_Kd mesh.png\n")
 
     with open(obj_path, 'w') as f:
-        f.write("mtllib mesh.mtl\nusemtl skin\n\n")
-        for v in vertices:
+        f.write("# SkinMapper mesh\nmtllib mesh.mtl\nusemtl skin\n\n")
+        for v in verts:
             f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        f.write("\n")
         for uv in uvs:
             f.write(f"vt {uv[0]:.6f} {uv[1]:.6f}\n")
-        for tri in triangles:
+        f.write("\n")
+        for tri in faces:
             f.write(f"f {tri[0]+1}/{tri[0]+1} {tri[1]+1}/{tri[1]+1} {tri[2]+1}/{tri[2]+1}\n")
 
 
@@ -518,7 +530,7 @@ def health():
     with lock:
         q, a = len(queue), active_count
     return jsonify(status='ok', colmap=colmap_ok, open3d=o3d_ok, gpu=HAS_GPU,
-                   gpu_name=GPU_NAME, version='3.2.0', active_jobs=a, queued_jobs=q)
+                   gpu_name=GPU_NAME, version='4.0.0', active_jobs=a, queued_jobs=q)
 
 
 @app.route('/submit', methods=['POST'])

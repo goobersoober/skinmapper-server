@@ -4,3 +4,6 @@ open3d==0.18.0
 Pillow==10.4.0
 numpy
 scipy
+trimesh
+xatlas
+opencv-python-headless
