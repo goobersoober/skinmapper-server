@@ -216,6 +216,7 @@ def run_pipeline(job_id, image_dir, job_dir):
         set_job(job_id, 'processing', 0.66, 'Building mesh…')
         import open3d as o3d
         import numpy as np
+        from scipy.spatial import cKDTree
 
         pcd = o3d.io.read_point_cloud(ply_path)
         pts = len(pcd.points)
@@ -225,34 +226,31 @@ def run_pipeline(job_id, image_dir, job_dir):
         if pts < 500:
             raise RuntimeError(f'Only {pts} points — take more overlapping photos.')
 
-        # Keep only the largest cluster (removes background/floor noise)
+        # Clean outliers (fast)
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        labels = np.array(pcd.cluster_dbscan(eps=0.02, min_points=10, print_progress=False))
-        if len(labels) > 0 and labels.max() >= 0:
-            largest = np.argmax(np.bincount(labels[labels >= 0]))
-            mask = labels == largest
-            pcd = pcd.select_by_index(np.where(mask)[0])
-            logging.info(f'[{tag}] After clustering: {len(pcd.points)} points (was {pts})')
+        logging.info(f'[{tag}] After outlier removal: {len(pcd.points)} points')
 
         # Save point cloud colors before meshing
-        pcd_points = np.asarray(pcd.points)
         pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
-        logging.info(f'[{tag}] Point cloud colors available: {pcd_colors is not None}')
+        pcd_points_arr = np.asarray(pcd.points)
+        logging.info(f'[{tag}] Point cloud colors: {pcd_colors is not None}')
+
+        # Downsample if huge (keeps colors)
+        if len(pcd.points) > 300000:
+            pcd = pcd.voxel_down_sample(0.002)
+            pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
+            pcd_points_arr = np.asarray(pcd.points)
+            logging.info(f'[{tag}] After downsample: {len(pcd.points)} points')
 
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30))
-        pcd.orient_normals_consistent_tangent_plane(100)
-
-        if len(pcd.points) > 500000:
-            pcd = pcd.voxel_down_sample(0.001)
-            pcd_points = np.asarray(pcd.points)
-            pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
+        pcd.orient_normals_consistent_tangent_plane(50)
 
         set_job(job_id, 'processing', 0.72, 'Creating surface…')
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
         densities = np.asarray(densities)
         mesh.remove_vertices_by_mask(densities < np.quantile(densities, 0.05))
 
-        target = min(100000, len(mesh.triangles))
+        target = min(50000, len(mesh.triangles))
         if len(mesh.triangles) > target:
             mesh = mesh.simplify_quadric_decimation(target)
         mesh.compute_vertex_normals()
@@ -261,19 +259,17 @@ def run_pipeline(job_id, image_dir, job_dir):
         if len(mesh.triangles) == 0:
             raise RuntimeError('Mesh generation failed — try more overlapping photos.')
 
-        # 8 — Transfer point cloud colors to mesh vertices via nearest-neighbor
+        # 8 — Transfer point cloud colors to mesh vertices (vectorized with scipy)
         set_job(job_id, 'processing', 0.76, 'Coloring mesh…')
         vertices = np.asarray(mesh.vertices)
         triangles = np.asarray(mesh.triangles)
 
         vertex_colors = None
         if pcd_colors is not None and len(pcd_colors) > 0:
-            pcd_tree = o3d.geometry.KDTreeFlann(pcd)
-            vertex_colors = np.zeros((len(vertices), 3))
-            for i, v in enumerate(vertices):
-                [_, idx, _] = pcd_tree.search_knn_vector_3d(v, 5)
-                vertex_colors[i] = pcd_colors[idx].mean(axis=0)
-            logging.info(f'[{tag}] Vertex colors: min={vertex_colors.min():.3f} max={vertex_colors.max():.3f}')
+            tree = cKDTree(pcd_points_arr)
+            _, idx = tree.query(vertices, k=3)
+            vertex_colors = pcd_colors[idx].mean(axis=1)  # avg of 3 nearest
+            logging.info(f'[{tag}] Vertex colors transferred: min={vertex_colors.min():.3f} max={vertex_colors.max():.3f}')
 
         # 9 — UV unwrap (cylindrical)
         set_job(job_id, 'processing', 0.78, 'UV unwrapping…')
@@ -349,86 +345,76 @@ def run_pipeline(job_id, image_dir, job_dir):
 
 # ── Texture baking from vertex colors ────────────────────────────────
 
-def bake_texture_from_vertex_colors(vertices, triangles, uvs, vertex_colors, tag, tex_size=4096):
-    """Rasterize vertex colors into UV texture space."""
+def bake_texture_from_vertex_colors(vertices, triangles, uvs, vertex_colors, tag, tex_size=2048):
+    """Rasterize vertex colors into UV texture space — fast vectorized version."""
     import numpy as np
     from PIL import Image, ImageFilter
 
     try:
-        tex_arr = np.full((tex_size, tex_size, 3), 180, dtype=np.float32)  # skin-tone default
-        weight_buf = np.zeros((tex_size, tex_size), dtype=np.float32)
-
         if vertex_colors is None:
             logging.warning(f'[{tag}] No vertex colors — returning skin-tone texture')
-            return Image.fromarray(tex_arr.astype(np.uint8))
+            return Image.fromarray(np.full((tex_size, tex_size, 3), 180, dtype=np.uint8))
 
-        # Colors from open3d are 0-1 float, convert to 0-255
-        colors_255 = (vertex_colors * 255).clip(0, 255)
+        colors_255 = (vertex_colors * 255).clip(0, 255).astype(np.float32)
 
-        logging.info(f'[{tag}] Rasterizing {len(triangles)} triangles into {tex_size}x{tex_size} texture')
+        # For each vertex, paint its color at its UV position (fast scatter)
+        tex_arr = np.full((tex_size, tex_size, 3), 0, dtype=np.float32)
+        weight_buf = np.zeros((tex_size, tex_size), dtype=np.float32)
 
-        for tri_idx, tri in enumerate(triangles):
-            v0, v1, v2 = tri
+        # Convert UVs to pixel coords
+        px_all = (uvs[:, 0] * (tex_size - 1)).astype(np.int32).clip(0, tex_size-1)
+        py_all = ((1 - uvs[:, 1]) * (tex_size - 1)).astype(np.int32).clip(0, tex_size-1)
 
-            # UV coords → pixel coords in texture
-            uv0 = uvs[v0]; uv1 = uvs[v1]; uv2 = uvs[v2]
-            tx0 = int(uv0[0] * (tex_size-1)); ty0 = int((1-uv0[1]) * (tex_size-1))
-            tx1 = int(uv1[0] * (tex_size-1)); ty1 = int((1-uv1[1]) * (tex_size-1))
-            tx2 = int(uv2[0] * (tex_size-1)); ty2 = int((1-uv2[1]) * (tex_size-1))
+        # Paint every vertex
+        for i in range(len(vertices)):
+            x, y = px_all[i], py_all[i]
+            tex_arr[y, x] = colors_255[i]
+            weight_buf[y, x] = 1.0
 
-            # Bounding box of triangle in texture space
-            min_x = max(0, min(tx0, tx1, tx2))
-            max_x = min(tex_size-1, max(tx0, tx1, tx2))
-            min_y = max(0, min(ty0, ty1, ty2))
-            max_y = min(tex_size-1, max(ty0, ty1, ty2))
+        # Also paint along triangle edges for better coverage
+        logging.info(f'[{tag}] Painting {len(triangles)} triangle edges...')
+        for tri in triangles:
+            for e in [(0,1), (1,2), (2,0)]:
+                i0, i1 = tri[e[0]], tri[e[1]]
+                x0, y0 = px_all[i0], py_all[i0]
+                x1, y1 = px_all[i1], py_all[i1]
+                c0, c1 = colors_255[i0], colors_255[i1]
+                # Skip seam-wrapping edges
+                if abs(x1-x0) > tex_size // 2:
+                    continue
+                steps = max(abs(x1-x0), abs(y1-y0), 1)
+                if steps > 500:
+                    continue
+                for s in range(steps + 1):
+                    t = s / max(steps, 1)
+                    x = int(x0 + (x1-x0) * t)
+                    y = int(y0 + (y1-y0) * t)
+                    if 0 <= x < tex_size and 0 <= y < tex_size:
+                        color = c0 * (1-t) + c1 * t
+                        tex_arr[y, x] = color
+                        weight_buf[y, x] = 1.0
 
-            # Skip degenerate or huge triangles (UV seam wrap-around)
-            if max_x - min_x > tex_size // 2 or max_y - min_y > tex_size // 2:
-                continue
-            if max_x - min_x > 500 or max_y - min_y > 500:
-                continue
+        painted_pct = (weight_buf > 0).sum() / weight_buf.size * 100
+        logging.info(f'[{tag}] After edge painting: {painted_pct:.1f}% covered')
 
-            c0 = colors_255[v0]; c1 = colors_255[v1]; c2 = colors_255[v2]
+        # Heavy dilation to fill interior of triangles and gaps
+        result = Image.fromarray(tex_arr.clip(0, 255).astype(np.uint8))
+        mask = weight_buf > 0
 
-            # Rasterize: for each pixel in bbox, check if inside triangle
-            for py in range(min_y, max_y + 1):
-                for px in range(min_x, max_x + 1):
-                    # Barycentric coordinates
-                    denom = (ty1-ty2)*(tx0-tx2) + (tx2-tx1)*(ty0-ty2)
-                    if abs(denom) < 1e-10:
-                        continue
-                    w0 = ((ty1-ty2)*(px-tx2) + (tx2-tx1)*(py-ty2)) / denom
-                    w1 = ((ty2-ty0)*(px-tx2) + (tx0-tx2)*(py-ty2)) / denom
-                    w2 = 1.0 - w0 - w1
+        # Iterative gap fill: blur and fill unpainted regions
+        for i in range(30):
+            result_arr = np.array(result).astype(np.float32)
+            blurred = np.array(result.filter(ImageFilter.BoxBlur(3))).astype(np.float32)
+            blurred_mask = np.array(Image.fromarray((mask * 255).astype(np.uint8)).filter(ImageFilter.BoxBlur(3))).astype(np.float32) / 255.0
+            # Fill unpainted pixels with blurred values
+            unpainted = ~mask
+            for c in range(3):
+                result_arr[:,:,c] = np.where(unpainted, blurred[:,:,c], result_arr[:,:,c])
+            mask = mask | (blurred_mask > 0.1)
+            result = Image.fromarray(result_arr.clip(0, 255).astype(np.uint8))
 
-                    if w0 >= -0.001 and w1 >= -0.001 and w2 >= -0.001:
-                        color = w0*c0 + w1*c1 + w2*c2
-                        tex_arr[py, px] = color.clip(0, 255)
-                        weight_buf[py, px] = 1.0
-
-        painted = weight_buf > 0
-        painted_pct = painted.sum() / painted.size * 100
-        logging.info(f'[{tag}] Texture: {painted_pct:.1f}% painted from vertex colors')
-
-        result = Image.fromarray(tex_arr.astype(np.uint8))
-
-        # Dilate painted regions to fill gaps (push-pull)
-        if painted_pct < 95:
-            mask = Image.fromarray((weight_buf * 255).astype(np.uint8))
-            for _ in range(20):
-                blurred = result.filter(ImageFilter.BoxBlur(2))
-                blurred_mask = mask.filter(ImageFilter.BoxBlur(2))
-                result_arr = np.array(result).astype(float)
-                blurred_arr = np.array(blurred).astype(float)
-                mask_arr = np.array(mask).astype(float) / 255.0
-                blurred_mask_arr = np.array(blurred_mask).astype(float) / 255.0
-                # Fill unpainted with blurred
-                unpainted = mask_arr < 0.5
-                for c in range(3):
-                    result_arr[:,:,c] = np.where(unpainted, blurred_arr[:,:,c], result_arr[:,:,c])
-                mask_arr = np.maximum(mask_arr, blurred_mask_arr)
-                result = Image.fromarray(result_arr.clip(0, 255).astype(np.uint8))
-                mask = Image.fromarray((mask_arr * 255).clip(0, 255).astype(np.uint8))
+        filled_pct = mask.sum() / mask.size * 100
+        logging.info(f'[{tag}] Texture: {filled_pct:.1f}% filled after dilation')
 
         return result
 
