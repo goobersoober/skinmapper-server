@@ -219,19 +219,33 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         pcd = o3d.io.read_point_cloud(ply_path)
         pts = len(pcd.points)
-        logging.info(f'[{tag}] Dense cloud: {pts} points')
+        has_colors = pcd.has_colors()
+        logging.info(f'[{tag}] Dense cloud: {pts} points, has_colors={has_colors}')
 
         if pts < 500:
             raise RuntimeError(f'Only {pts} points — take more overlapping photos.')
 
+        # Keep only the largest cluster (removes background/floor noise)
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        logging.info(f'[{tag}] After cleanup: {len(pcd.points)} points')
+        labels = np.array(pcd.cluster_dbscan(eps=0.02, min_points=10, print_progress=False))
+        if len(labels) > 0 and labels.max() >= 0:
+            largest = np.argmax(np.bincount(labels[labels >= 0]))
+            mask = labels == largest
+            pcd = pcd.select_by_index(np.where(mask)[0])
+            logging.info(f'[{tag}] After clustering: {len(pcd.points)} points (was {pts})')
+
+        # Save point cloud colors before meshing
+        pcd_points = np.asarray(pcd.points)
+        pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
+        logging.info(f'[{tag}] Point cloud colors available: {pcd_colors is not None}')
 
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30))
         pcd.orient_normals_consistent_tangent_plane(100)
 
         if len(pcd.points) > 500000:
             pcd = pcd.voxel_down_sample(0.001)
+            pcd_points = np.asarray(pcd.points)
+            pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
 
         set_job(job_id, 'processing', 0.72, 'Creating surface…')
         mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
@@ -247,14 +261,24 @@ def run_pipeline(job_id, image_dir, job_dir):
         if len(mesh.triangles) == 0:
             raise RuntimeError('Mesh generation failed — try more overlapping photos.')
 
-        # 8 — UV unwrap (cylindrical)
-        set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
-        vertices_original = np.asarray(mesh.vertices)  # COLMAP coordinates — for texture baking
+        # 8 — Transfer point cloud colors to mesh vertices via nearest-neighbor
+        set_job(job_id, 'processing', 0.76, 'Coloring mesh…')
+        vertices = np.asarray(mesh.vertices)
         triangles = np.asarray(mesh.triangles)
 
-        # UV unwrap uses original coordinates (scale doesn't affect UVs)
-        center = vertices_original.mean(axis=0)
-        centered = vertices_original - center
+        vertex_colors = None
+        if pcd_colors is not None and len(pcd_colors) > 0:
+            pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+            vertex_colors = np.zeros((len(vertices), 3))
+            for i, v in enumerate(vertices):
+                [_, idx, _] = pcd_tree.search_knn_vector_3d(v, 5)
+                vertex_colors[i] = pcd_colors[idx].mean(axis=0)
+            logging.info(f'[{tag}] Vertex colors: min={vertex_colors.min():.3f} max={vertex_colors.max():.3f}')
+
+        # 9 — UV unwrap (cylindrical)
+        set_job(job_id, 'processing', 0.78, 'UV unwrapping…')
+        center = vertices.mean(axis=0)
+        centered = vertices - center
         cov = np.cov(centered.T)
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
         axis = eigenvectors[:, np.argmax(eigenvalues)]
@@ -271,23 +295,20 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         uvs = np.column_stack([u, v])
 
-        # 9 — Bake texture from photos (must use original COLMAP coordinates for projection)
-        set_job(job_id, 'processing', 0.80, 'Baking skin texture…')
-        texture = bake_texture(
-            vertices_original, triangles, uvs, sparse0,
-            os.path.join(dense, 'images'), tag
+        # 10 — Bake texture by rasterizing colored triangles into UV space
+        set_job(job_id, 'processing', 0.82, 'Baking skin texture…')
+        texture = bake_texture_from_vertex_colors(
+            vertices, triangles, uvs, vertex_colors, tag
         )
 
         # Normalize mesh to real-world scale (~0.35m longest axis = typical limb)
-        bbox = vertices_original.max(axis=0) - vertices_original.min(axis=0)
+        bbox = vertices.max(axis=0) - vertices.min(axis=0)
         current_size = bbox.max()
         if current_size > 0:
             target_size = 0.35  # 35cm in meters
             scale = target_size / current_size
-            vertices = vertices_original * scale
+            vertices = vertices * scale
             logging.info(f'[{tag}] Normalized mesh: scale={scale:.4f}, bbox was {bbox}, now {bbox*scale}')
-        else:
-            vertices = vertices_original
 
         # 10 — Export OBJ + MTL + texture as zip
         set_job(job_id, 'processing', 0.92, 'Packaging result…')
@@ -326,122 +347,88 @@ def run_pipeline(job_id, image_dir, job_dir):
             except: pass
 
 
-# ── Texture baking ───────────────────────────────────────────────────
+# ── Texture baking from vertex colors ────────────────────────────────
 
-def bake_texture(vertices, triangles, uvs, sparse_path, image_dir, tag, tex_size=4096):
-    """Project photos onto mesh using COLMAP camera poses."""
+def bake_texture_from_vertex_colors(vertices, triangles, uvs, vertex_colors, tag, tex_size=4096):
+    """Rasterize vertex colors into UV texture space."""
     import numpy as np
     from PIL import Image, ImageFilter
 
     try:
-        cameras = read_colmap_cameras_bin(os.path.join(sparse_path, 'cameras.bin'))
-        images_meta = read_colmap_images_bin(os.path.join(sparse_path, 'images.bin'))
-
-        if not cameras or not images_meta:
-            logging.warning(f'[{tag}] No camera data — skipping texture')
-            return None
-
-        logging.info(f'[{tag}] Baking: {len(cameras)} cameras, {len(images_meta)} images, {len(vertices)} verts, {len(triangles)} tris')
-        for cid, cam in cameras.items():
-            logging.info(f'[{tag}]   Camera {cid}: model={cam.get("model_id","?")} w={cam["w"]} h={cam["h"]} params={cam["params"][:4]}...')
-
-        tex = Image.new('RGB', (tex_size, tex_size), (180, 144, 120))
-        tex_arr = np.array(tex)
+        tex_arr = np.full((tex_size, tex_size, 3), 180, dtype=np.float32)  # skin-tone default
         weight_buf = np.zeros((tex_size, tex_size), dtype=np.float32)
 
-        for img_data in images_meta.values():
-            cam = cameras.get(img_data['camera_id'])
-            if not cam:
+        if vertex_colors is None:
+            logging.warning(f'[{tag}] No vertex colors — returning skin-tone texture')
+            return Image.fromarray(tex_arr.astype(np.uint8))
+
+        # Colors from open3d are 0-1 float, convert to 0-255
+        colors_255 = (vertex_colors * 255).clip(0, 255)
+
+        logging.info(f'[{tag}] Rasterizing {len(triangles)} triangles into {tex_size}x{tex_size} texture')
+
+        for tri_idx, tri in enumerate(triangles):
+            v0, v1, v2 = tri
+
+            # UV coords → pixel coords in texture
+            uv0 = uvs[v0]; uv1 = uvs[v1]; uv2 = uvs[v2]
+            tx0 = int(uv0[0] * (tex_size-1)); ty0 = int((1-uv0[1]) * (tex_size-1))
+            tx1 = int(uv1[0] * (tex_size-1)); ty1 = int((1-uv1[1]) * (tex_size-1))
+            tx2 = int(uv2[0] * (tex_size-1)); ty2 = int((1-uv2[1]) * (tex_size-1))
+
+            # Bounding box of triangle in texture space
+            min_x = max(0, min(tx0, tx1, tx2))
+            max_x = min(tex_size-1, max(tx0, tx1, tx2))
+            min_y = max(0, min(ty0, ty1, ty2))
+            max_y = min(tex_size-1, max(ty0, ty1, ty2))
+
+            # Skip degenerate or huge triangles (UV seam wrap-around)
+            if max_x - min_x > tex_size // 2 or max_y - min_y > tex_size // 2:
+                continue
+            if max_x - min_x > 500 or max_y - min_y > 500:
                 continue
 
-            img_path = os.path.join(image_dir, img_data['name'])
-            if not os.path.exists(img_path):
-                continue
+            c0 = colors_255[v0]; c1 = colors_255[v1]; c2 = colors_255[v2]
 
-            try:
-                photo = np.array(Image.open(img_path))
-                ph, pw = photo.shape[:2]
-            except:
-                continue
+            # Rasterize: for each pixel in bbox, check if inside triangle
+            for py in range(min_y, max_y + 1):
+                for px in range(min_x, max_x + 1):
+                    # Barycentric coordinates
+                    denom = (ty1-ty2)*(tx0-tx2) + (tx2-tx1)*(ty0-ty2)
+                    if abs(denom) < 1e-10:
+                        continue
+                    w0 = ((ty1-ty2)*(px-tx2) + (tx2-tx1)*(py-ty2)) / denom
+                    w1 = ((ty2-ty0)*(px-tx2) + (tx0-tx2)*(py-ty2)) / denom
+                    w2 = 1.0 - w0 - w1
 
-            # Extract fx, fy, cx, cy based on COLMAP camera model
-            model_id = cam.get('model_id', 1)
-            params = cam['params']
-            if model_id == 0:  # SIMPLE_PINHOLE: f, cx, cy
-                fx = fy = params[0]; cx = params[1]; cy = params[2]
-            elif model_id == 1:  # PINHOLE: fx, fy, cx, cy
-                fx = params[0]; fy = params[1]; cx = params[2]; cy = params[3]
-            elif model_id == 2:  # SIMPLE_RADIAL: f, cx, cy, k
-                fx = fy = params[0]; cx = params[1]; cy = params[2]
-            elif model_id == 3:  # RADIAL: f, cx, cy, k1, k2
-                fx = fy = params[0]; cx = params[1]; cy = params[2]
-            elif model_id == 4:  # OPENCV: fx, fy, cx, cy, k1, k2, p1, p2
-                fx = params[0]; fy = params[1]; cx = params[2]; cy = params[3]
-            else:  # Default: try as PINHOLE
-                fx = params[0]; fy = params[1] if len(params) > 3 else params[0]
-                cx = params[2] if len(params) > 3 else params[1]
-                cy = params[3] if len(params) > 3 else params[2]
-            R = img_data['R']
-            t = img_data['t']
+                    if w0 >= -0.001 and w1 >= -0.001 and w2 >= -0.001:
+                        color = w0*c0 + w1*c1 + w2*c2
+                        tex_arr[py, px] = color.clip(0, 255)
+                        weight_buf[py, px] = 1.0
 
-            # Project all vertices to this camera
-            cam_pts = (R @ vertices.T).T + t
-            valid = cam_pts[:, 2] > 0.01
-
-            px = (fx * cam_pts[:, 0] / cam_pts[:, 2] + cx)
-            py = (fy * cam_pts[:, 1] / cam_pts[:, 2] + cy)
-            depths = cam_pts[:, 2]
-
-            # Log projection stats for debugging
-            in_frame = (px >= 0) & (px < pw) & (py >= 0) & (py < ph) & valid
-            logging.info(f'[{tag}]   {img_data["name"]}: {in_frame.sum()}/{len(vertices)} verts in frame, '
-                        f'fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}, '
-                        f'px range=[{px[valid].min():.0f},{px[valid].max():.0f}] '
-                        f'py range=[{py[valid].min():.0f},{py[valid].max():.0f}]')
-
-            # For each triangle, check if all 3 vertices project into this view
-            for tri in triangles:
-                v0, v1, v2 = tri
-                if not (valid[v0] and valid[v1] and valid[v2]):
-                    continue
-
-                # Check all 3 pixel coords are in frame
-                pxs = [px[v0], px[v1], px[v2]]
-                pys = [py[v0], py[v1], py[v2]]
-                if any(x < 0 or x >= pw for x in pxs) or any(y < 0 or y >= ph for y in pys):
-                    continue
-
-                # Rasterize triangle in UV space
-                uv0, uv1, uv2 = uvs[v0], uvs[v1], uvs[v2]
-                tu = [int(uv0[0] * (tex_size-1)), int(uv1[0] * (tex_size-1)), int(uv2[0] * (tex_size-1))]
-                tv = [int((1-uv0[1]) * (tex_size-1)), int((1-uv1[1]) * (tex_size-1)), int((1-uv2[1]) * (tex_size-1))]
-
-                # Simple: sample at each vertex
-                avg_depth = (depths[v0] + depths[v1] + depths[v2]) / 3
-                weight = 1.0 / max(avg_depth, 0.1)
-
-                for k in range(3):
-                    sx, sy = int(pxs[k]), int(pys[k])
-                    tx, ty = max(0, min(tex_size-1, tu[k])), max(0, min(tex_size-1, tv[k]))
-
-                    if sy < ph and sx < pw and weight > weight_buf[ty, tx] * 0.5:
-                        color = photo[sy, sx]
-                        if len(color) >= 3:
-                            old_w = weight_buf[ty, tx]
-                            new_w = old_w + weight
-                            # Weighted average blending
-                            tex_arr[ty, tx] = (tex_arr[ty, tx].astype(float) * old_w + color[:3].astype(float) * weight) / new_w
-                            weight_buf[ty, tx] = new_w
-
-        # Fill gaps by dilating
-        result = Image.fromarray(tex_arr.astype(np.uint8))
         painted = weight_buf > 0
         painted_pct = painted.sum() / painted.size * 100
-        logging.info(f'[{tag}] Texture: {painted_pct:.1f}% painted from {len(images_meta)} views')
+        logging.info(f'[{tag}] Texture: {painted_pct:.1f}% painted from vertex colors')
 
-        # Dilate to fill small gaps
-        for _ in range(5):
-            result = result.filter(ImageFilter.MedianFilter(3))
+        result = Image.fromarray(tex_arr.astype(np.uint8))
+
+        # Dilate painted regions to fill gaps (push-pull)
+        if painted_pct < 95:
+            mask = Image.fromarray((weight_buf * 255).astype(np.uint8))
+            for _ in range(20):
+                blurred = result.filter(ImageFilter.BoxBlur(2))
+                blurred_mask = mask.filter(ImageFilter.BoxBlur(2))
+                result_arr = np.array(result).astype(float)
+                blurred_arr = np.array(blurred).astype(float)
+                mask_arr = np.array(mask).astype(float) / 255.0
+                blurred_mask_arr = np.array(blurred_mask).astype(float) / 255.0
+                # Fill unpainted with blurred
+                unpainted = mask_arr < 0.5
+                for c in range(3):
+                    result_arr[:,:,c] = np.where(unpainted, blurred_arr[:,:,c], result_arr[:,:,c])
+                mask_arr = np.maximum(mask_arr, blurred_mask_arr)
+                result = Image.fromarray(result_arr.clip(0, 255).astype(np.uint8))
+                mask = Image.fromarray((mask_arr * 255).clip(0, 255).astype(np.uint8))
 
         return result
 
@@ -545,7 +532,7 @@ def health():
     with lock:
         q, a = len(queue), active_count
     return jsonify(status='ok', colmap=colmap_ok, open3d=o3d_ok, gpu=HAS_GPU,
-                   gpu_name=GPU_NAME, version='3.1.0', active_jobs=a, queued_jobs=q)
+                   gpu_name=GPU_NAME, version='3.2.0', active_jobs=a, queued_jobs=q)
 
 
 @app.route('/submit', methods=['POST'])
