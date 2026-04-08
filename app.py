@@ -5,6 +5,11 @@ COLMAP (dense reconstruction) + open3d (meshing) + texture baking from photos
 
 import os, uuid, zipfile, subprocess, threading, json, shutil, logging, traceback, time, struct
 from collections import deque
+
+# COLMAP requires a display on headless servers — force offscreen Qt
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+os.environ['DISPLAY'] = ''
+
 from flask import Flask, request, jsonify, send_file
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
