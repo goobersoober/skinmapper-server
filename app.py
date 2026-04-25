@@ -424,8 +424,13 @@ def run_pipeline(job_id, image_dir, job_dir):
         set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
 
         _cov_verts = verts - verts.mean(axis=0)
-        _eigvals, _eigvecs = np.linalg.eigh(_cov_verts.T @ _cov_verts)
-        _elongation = float(_eigvals[-1] / (_eigvals[-2] + 1e-10))
+        try:
+            _eigvals, _eigvecs = np.linalg.eigh(_cov_verts.T @ _cov_verts)
+            _elongation = float(_eigvals[-1] / (_eigvals[-2] + 1e-10))
+        except np.linalg.LinAlgError:
+            logging.warning(f'[{tag}] PCA eigendecomposition failed — defaulting to xatlas')
+            _elongation = 1.0
+            _eigvecs = np.eye(3, dtype=np.float32)
         logging.info(f'[{tag}] PCA elongation ratio: {_elongation:.2f}')
         USE_CYLINDRICAL = _elongation > 3.0
 
