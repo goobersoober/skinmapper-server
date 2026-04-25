@@ -315,9 +315,10 @@ def run_pipeline(job_id, image_dir, job_dir):
         densities = np.asarray(densities)
         logging.info(f'[{tag}] Poisson raw: {len(mesh.vertices)} verts, {len(mesh.triangles)} tris')
 
-        # Aggressive density trim — kills the hallucinated back surface.
-        # For a half-wrap scan, the unscanned side has near-zero density.
-        density_threshold = np.quantile(densities, 0.30)
+        # Density trim — removes truly hallucinated geometry (near-zero density).
+        # q=0.05 is conservative: only removes the absolute bottom 5% density
+        # which is the pure hallucination, keeping all real scan boundaries.
+        density_threshold = np.quantile(densities, 0.05)
         mesh.remove_vertices_by_mask(densities < density_threshold)
         logging.info(f'[{tag}] After density trim (q=0.30): {len(mesh.triangles)} tris')
 
@@ -617,15 +618,21 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
         M = len(valid_tv)
         logging.info(f'[{tag}] UV rasterised: {M} texels')
 
-        # ── Pass 1: per-texel best-camera selection (no image I/O) ─────
-        # For each texel we store which camera had the best viewing angle.
-        # Picking a SINGLE camera per texel (not blending) prevents the
-        # multicolour mosaic that comes from mixing cameras with different
-        # exposure / white-balance.
-        best_score  = np.full(M, -1.0, dtype=np.float64)
-        best_img_x  = np.zeros(M,      dtype=np.float64)
-        best_img_y  = np.zeros(M,      dtype=np.float64)
-        best_cam_id = np.full(M, -1,   dtype=np.int32)
+        # ── Find UV islands (connected components of the rasterised UV) ──
+        # Each UV island gets ONE camera for its entire surface.
+        # This eliminates colour seams inside islands — the same approach
+        # used by Reality Capture, Meshroom, and colmap-texture.
+        num_islands, island_map = cv2.connectedComponents(has_data.astype(np.uint8))
+        island_ids = island_map[valid_tv, valid_tu]   # (M,) island index per texel
+        logging.info(f'[{tag}] UV has {num_islands - 1} islands')
+
+        # ── Pass 1: score each (island, camera) pair (no image I/O) ────
+        # For every texel visible from a camera, add its dot-product score
+        # to that (island, camera) bucket. Best score per island wins.
+        # Also cache per-texel pixel coords for every camera (used in 1b).
+        island_cam_score = np.zeros((num_islands, len(cam_list)), dtype=np.float64)
+        all_img_x = np.zeros((M, len(cam_list)), dtype=np.float32)
+        all_img_y = np.zeros((M, len(cam_list)), dtype=np.float32)
 
         for ci, c in enumerate(cam_list):
             R, t = c['R'], c['t']
@@ -642,19 +649,32 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             img_y = fy * pts_cam[:, 1] * iz + cy
 
             in_bounds = (img_x >= 0) & (img_x < iw - 1) & (img_y >= 0) & (img_y < ih - 1)
-
             vd  = cam_pos - valid_pos
-            dot = np.einsum('ij,ij->i', valid_n, vd / (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10))
+            dot = np.einsum('ij,ij->i', valid_n,
+                            vd / (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10))
 
-            improve = in_front & in_bounds & (dot > 0.1) & (dot > best_score)
-            if improve.any():
-                best_score [improve] = dot  [improve]
-                best_img_x [improve] = img_x[improve]
-                best_img_y [improve] = img_y[improve]
-                best_cam_id[improve] = ci
+            visible = in_front & in_bounds & (dot > 0.1)
+            np.add.at(island_cam_score[:, ci], island_ids[visible], dot[visible])
+
+            all_img_x[:, ci] = img_x.astype(np.float32)
+            all_img_y[:, ci] = img_y.astype(np.float32)
+
+        # Per island: camera with highest accumulated score wins
+        island_best = np.argmax(island_cam_score, axis=1)     # (num_islands,)
+        island_best[island_cam_score.max(axis=1) <= 0] = -1   # no camera covers island
+
+        # Map each texel → its island's best camera, and look up its pixel coords
+        best_cam_id = island_best[island_ids].astype(np.int32)
+        cam_idx_safe = np.clip(best_cam_id, 0, len(cam_list) - 1)
+        best_img_x = all_img_x[np.arange(M), cam_idx_safe].astype(np.float64)
+        best_img_y = all_img_y[np.arange(M), cam_idx_safe].astype(np.float64)
+        best_cam_id[island_ids == 0] = -1   # background pixels have no camera
+        del all_img_x, all_img_y            # free ~(M × N_cams × 8 bytes) memory
 
         claimed = (best_cam_id >= 0).sum()
-        logging.info(f'[{tag}] Pass 1 done: {claimed}/{M} texels assigned ({claimed/M*100:.1f}%)')
+        n_covered = int((island_best >= 0).sum())
+        logging.info(f'[{tag}] Island assignment: {n_covered}/{num_islands-1} islands '
+                     f'covered → {claimed}/{M} texels ({claimed/M*100:.1f}%)')
         if claimed == 0:
             logging.warning(f'[{tag}] No texels claimed by any camera')
             return None
