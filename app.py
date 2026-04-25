@@ -272,7 +272,28 @@ def run_pipeline(job_id, image_dir, job_dir):
             pcd = pcd.select_by_index(np.where(keep_mask)[0])
             logging.info(f'[{tag}] DBSCAN: kept {keep_mask.sum()} pts across {len(keep_ids)} clusters (of {len(counts)} total, eps={eps:.4f})')
 
-        # Save colors for later
+        # ── RANSAC floor/plane removal ─────────────────────────────────
+        # Removes the dominant flat surface (floor, table) from the point
+        # cloud BEFORE Poisson. This is the correct place to separate the
+        # body part from background — not at the mesh stage.
+        # DBSCAN can't separate arm+table if they're touching (same cluster).
+        # RANSAC finds and removes the largest flat plane regardless.
+        try:
+            _plane, _inliers = pcd.segment_plane(
+                distance_threshold=0.01,   # 1 cm tolerance for plane membership
+                ransac_n=3,
+                num_iterations=1000
+            )
+            _pct = len(_inliers) / len(pcd.points)
+            if 0.05 < _pct < 0.65:        # found a real plane (5-65% of points)
+                pcd = pcd.select_by_index(_inliers, invert=True)
+                logging.info(f'[{tag}] RANSAC: removed {len(_inliers)} floor/plane pts ({_pct*100:.1f}%)')
+            else:
+                logging.info(f'[{tag}] RANSAC: no dominant plane ({_pct*100:.1f}% inliers), skipping')
+        except Exception as _e:
+            logging.info(f'[{tag}] RANSAC plane removal skipped: {_e}')
+
+        # Save point cloud for later (point-cloud guided mesh trimming)
         pcd_points = np.asarray(pcd.points)
         pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
 
@@ -383,13 +404,27 @@ def run_pipeline(job_id, image_dir, job_dir):
         if len(faces) < 100:
             raise RuntimeError('Mesh too small — try more overlapping photos.')
 
-        # ── Step 9: UV unwrap with xatlas ───────────────────────────────
-        # xatlas handles any body part shape (arms, legs, hands, shoulders).
-        # With a watertight Poisson mesh (no holes), xatlas produces far
-        # fewer UV islands than before — no hole-edges to fragment on.
+        # ── Step 9: UV unwrap with xatlas (relaxed chart options) ──────
+        # Default xatlas max_cost=2.0 creates ~1000 islands on a curved arm.
+        # max_cost=8.0 allows more UV stretch per chart → 10-30 islands.
+        # Fewer islands = fewer seam boundaries = clean printable texture.
         set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
 
-        vmapping, new_faces, uvs = xatlas.parametrize(verts, faces)
+        try:
+            _atlas = xatlas.Atlas()
+            _atlas.add_mesh(verts, faces)
+            _co = xatlas.ChartOptions()
+            _co.max_cost = 8.0              # default 2.0 → 1000+ islands; 8.0 → ~20 islands
+            _co.normal_deviation_weight = 0.5  # less sensitive to normal changes
+            _po = xatlas.PackOptions()
+            _po.resolution = 2048
+            _po.padding = 2
+            _atlas.generate(chart_options=_co, pack_options=_po)
+            vmapping, new_faces, uvs = _atlas[0]
+        except Exception as _xe:
+            logging.warning(f'[{tag}] xatlas Atlas API unavailable ({_xe}), using parametrize')
+            vmapping, new_faces, uvs = xatlas.parametrize(verts, faces)
+
         new_verts = verts[vmapping]
         logging.info(f'[{tag}] xatlas: {len(new_verts)} verts, {len(new_faces)} tris, '
                      f'UV range u=[{uvs[:,0].min():.3f},{uvs[:,0].max():.3f}] '
