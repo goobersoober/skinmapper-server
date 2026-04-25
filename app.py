@@ -471,6 +471,7 @@ def _read_colmap_cameras_txt(path):
 
 def _read_colmap_images_txt(path):
     """Parse images.txt → list of dicts with R, t, camera_id, name."""
+    import numpy as np  # needed: this is a module-level function
     images = []
     if not os.path.exists(path):
         return images
@@ -500,10 +501,15 @@ def _read_colmap_images_txt(path):
 def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size, tag):
     """
     Project original photos onto the UV texture map using COLMAP camera poses.
-    This is equivalent to Blender's 'Selected to Active' diffuse bake:
-    for each UV texel, find its 3D world position, project into every camera,
-    sample the photo, and blend contributions weighted by face-to-camera angle.
-    Fully vectorised — processes one camera at a time.
+
+    Uses per-texel BEST-CAMERA selection: for each UV pixel, pick the single
+    camera with the highest face-to-camera dot product (most face-on view).
+    This prevents color mixing between cameras (which causes the mosaic artefact)
+    and matches how Reality Capture / Meshroom bake textures.
+
+    Two-pass approach (no redundant image I/O):
+      Pass 1 — geometry only: determine which camera wins each texel.
+      Pass 2 — sampling: load each image once, write all its texels.
     """
     import cv2
     import numpy as np
@@ -515,13 +521,27 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
         if not cameras or not images:
             logging.warning(f'[{tag}] No COLMAP cameras/images found — skipping photo bake')
             return None
-        logging.info(f'[{tag}] Photo bake: {len(cameras)} cameras, {len(images)} images')
 
-        verts_np = np.array(verts, dtype=np.float64)   # (N,3)
-        faces_np = np.array(faces, dtype=np.int32)     # (F,3)
-        uvs_np   = np.array(uvs,   dtype=np.float32)   # (N,2)
+        # Filter to images that exist on disk and have valid intrinsics
+        cam_list = []
+        for img_info in images:
+            img_path = os.path.join(image_dir, img_info['name'])
+            if not os.path.exists(img_path):
+                continue
+            cam = cameras.get(img_info['camera_id'])
+            if cam is None:
+                continue
+            cam_list.append({**img_info, 'path': img_path, 'cam': cam})
+        logging.info(f'[{tag}] Photo bake: {len(cam_list)} valid images out of {len(images)}')
+        if not cam_list:
+            logging.warning(f'[{tag}] No valid image files found on disk')
+            return None
 
-        # ── Build UV→3D position map (one-time, vectorised per triangle) ──
+        verts_np = np.array(verts, dtype=np.float64)
+        faces_np = np.array(faces, dtype=np.int32)
+        uvs_np   = np.array(uvs,   dtype=np.float32)
+
+        # ── Build UV→3D position + normal map ──────────────────────────
         pos_map    = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
         normal_map = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
         has_data   = np.zeros((tex_size, tex_size),    dtype=bool)
@@ -536,14 +556,13 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             uv1 = uvs_np[faces_np[fi, 1]]
             uv2 = uvs_np[faces_np[fi, 2]]
 
-            edge1 = v1 - v0; edge2 = v2 - v0
-            n = np.cross(edge1, edge2)
+            n = np.cross(v1 - v0, v2 - v0)
             n_len = np.linalg.norm(n)
             if n_len < 1e-10:
                 continue
             n = n / n_len
 
-            # UV → pixel coords (flip V: UV origin=bottom-left, image origin=top-left)
+            # UV → pixel coords (flip V: UV origin bottom-left, image origin top-left)
             px = np.array([
                 [uv0[0] * tex_size, (1 - uv0[1]) * tex_size],
                 [uv1[0] * tex_size, (1 - uv1[1]) * tex_size],
@@ -557,15 +576,11 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             if max_u <= min_u or max_v <= min_v:
                 continue
 
-            # Vectorised barycentric over bounding-box pixels
             us = np.arange(min_u, max_u + 1, dtype=np.float32) + 0.5
             vs = np.arange(min_v, max_v + 1, dtype=np.float32) + 0.5
             uu, vv = np.meshgrid(us, vs)
 
             p0, p1, p2 = px[0], px[1], px[2]
-            def cross2d(ax, ay, bx, by):
-                return ax * by - ay * bx
-
             d_x = uu - p0[0]; d_y = vv - p0[1]
             d1_x = p1[0]-p0[0]; d1_y = p1[1]-p0[1]
             d2_x = p2[0]-p0[0]; d2_y = p2[1]-p0[1]
@@ -581,13 +596,13 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
                 continue
 
             w0c = np.clip(w0, 0, 1); w1c = np.clip(w1, 0, 1); w2c = np.clip(w2, 0, 1)
-            ws  = w0c + w1c + w2c + 1e-10
+            ws = w0c + w1c + w2c + 1e-10
             w0c /= ws; w1c /= ws; w2c /= ws
 
             pos3d = (w0c[..., None]*v0 + w1c[..., None]*v1 + w2c[..., None]*v2).astype(np.float32)
-
             tv = np.clip((vv - 0.5).astype(int), 0, tex_size-1)
             tu = np.clip((uu - 0.5).astype(int), 0, tex_size-1)
+
             pos_map   [tv[inside], tu[inside]] = pos3d[inside]
             normal_map[tv[inside], tu[inside]] = n.astype(np.float32)
             has_data  [tv[inside], tu[inside]] = True
@@ -597,86 +612,93 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             logging.warning(f'[{tag}] UV position map empty')
             return None
 
-        valid_pos = pos_map[valid_tv, valid_tu].astype(np.float64)      # (M,3)
-        valid_n   = normal_map[valid_tv, valid_tu].astype(np.float64)   # (M,3)
+        valid_pos = pos_map[valid_tv, valid_tu].astype(np.float64)
+        valid_n   = normal_map[valid_tv, valid_tu].astype(np.float64)
+        M = len(valid_tv)
+        logging.info(f'[{tag}] UV rasterised: {M} texels')
 
-        tex_accum    = np.zeros((tex_size, tex_size, 3), dtype=np.float64)
-        weight_accum = np.zeros((tex_size, tex_size),    dtype=np.float64)
+        # ── Pass 1: per-texel best-camera selection (no image I/O) ─────
+        # For each texel we store which camera had the best viewing angle.
+        # Picking a SINGLE camera per texel (not blending) prevents the
+        # multicolour mosaic that comes from mixing cameras with different
+        # exposure / white-balance.
+        best_score  = np.full(M, -1.0, dtype=np.float64)
+        best_img_x  = np.zeros(M,      dtype=np.float64)
+        best_img_y  = np.zeros(M,      dtype=np.float64)
+        best_cam_id = np.full(M, -1,   dtype=np.int32)
 
-        # ── Per-camera: project, sample, accumulate ────────────────────
-        for img_info in images:
-            img_path = os.path.join(image_dir, img_info['name'])
-            if not os.path.exists(img_path):
-                continue
-            img_bgr = cv2.imread(img_path)
-            if img_bgr is None:
-                continue
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            ih, iw = img_rgb.shape[:2]
+        for ci, c in enumerate(cam_list):
+            R, t = c['R'], c['t']
+            cam  = c['cam']
+            cam_pos = -R.T @ t
 
-            cam = cameras.get(img_info['camera_id'])
-            if cam is None:
-                continue
-
-            R = img_info['R']
-            t = img_info['t']
-            cam_pos = (-R.T @ t)                               # world-space camera centre
-
-            # Project all valid 3D points into this camera (vectorised)
-            pts_cam = (R @ valid_pos.T).T + t                 # (M,3)
+            pts_cam  = (R @ valid_pos.T).T + t
             in_front = pts_cam[:, 2] > 0.01
 
             fx, fy, cx, cy = cam['fx'], cam['fy'], cam['cx'], cam['cy']
-            iz = np.where(in_front, 1.0 / (pts_cam[:, 2] + 1e-10), 0.0)
+            iw, ih = cam['w'], cam['h']
+            iz    = np.where(in_front, 1.0 / (pts_cam[:, 2] + 1e-10), 0.0)
             img_x = fx * pts_cam[:, 0] * iz + cx
             img_y = fy * pts_cam[:, 1] * iz + cy
 
             in_bounds = (img_x >= 0) & (img_x < iw - 1) & (img_y >= 0) & (img_y < ih - 1)
 
-            # Angle weight: dot(face_normal, view_direction)
-            vd = cam_pos - valid_pos
-            vd_len = np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10
-            vd_n = vd / vd_len
-            dot = np.einsum('ij,ij->i', valid_n, vd_n)
+            vd  = cam_pos - valid_pos
+            dot = np.einsum('ij,ij->i', valid_n, vd / (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10))
 
-            mask = in_front & in_bounds & (dot > 0.1)
-            if not mask.any():
-                continue
+            improve = in_front & in_bounds & (dot > 0.1) & (dot > best_score)
+            if improve.any():
+                best_score [improve] = dot  [improve]
+                best_img_x [improve] = img_x[improve]
+                best_img_y [improve] = img_y[improve]
+                best_cam_id[improve] = ci
 
-            sx = img_x[mask]; sy = img_y[mask]; w = dot[mask]
-            x0 = sx.astype(int); y0 = sy.astype(int)
-            x0 = np.clip(x0, 0, iw - 2); y0 = np.clip(y0, 0, ih - 2)
-            xf = sx - x0; yf = sy - y0
-
-            # Bilinear sample
-            colors = (img_rgb[y0,   x0  ] * ((1-xf)*(1-yf))[:, None] +
-                      img_rgb[y0,   x0+1] * (   xf *(1-yf))[:, None] +
-                      img_rgb[y0+1, x0  ] * ((1-xf)*   yf )[:, None] +
-                      img_rgb[y0+1, x0+1] * (   xf *   yf )[:, None])  # (K,3)
-
-            ty_m = valid_tv[mask]; tx_m = valid_tu[mask]
-            np.add.at(tex_accum[:, :, 0], (ty_m, tx_m), colors[:, 0] * w)
-            np.add.at(tex_accum[:, :, 1], (ty_m, tx_m), colors[:, 1] * w)
-            np.add.at(tex_accum[:, :, 2], (ty_m, tx_m), colors[:, 2] * w)
-            np.add.at(weight_accum,       (ty_m, tx_m), w)
-
-            logging.info(f'[{tag}] Photo bake cam {img_info["name"]}: {mask.sum()} texels')
-
-        # ── Normalise and inpaint ──────────────────────────────────────
-        has_w = weight_accum > 0
-        if not has_w.any():
-            logging.warning(f'[{tag}] Photo bake produced no texels')
+        claimed = (best_cam_id >= 0).sum()
+        logging.info(f'[{tag}] Pass 1 done: {claimed}/{M} texels assigned ({claimed/M*100:.1f}%)')
+        if claimed == 0:
+            logging.warning(f'[{tag}] No texels claimed by any camera')
             return None
 
-        result = np.zeros((tex_size, tex_size, 3), dtype=np.uint8)
-        result[has_w] = (tex_accum[has_w] / weight_accum[has_w, None] * 255).clip(0, 255).astype(np.uint8)
+        # ── Pass 2: sample from the winning camera (load each image once) ──
+        result_rgb = np.zeros((M, 3), dtype=np.float32)
 
-        inpaint_mask = (~has_data | ~has_w).astype(np.uint8) * 255
+        for ci, c in enumerate(cam_list):
+            mask = best_cam_id == ci
+            if not mask.any():
+                continue
+            img_bgr = cv2.imread(c['path'])
+            if img_bgr is None:
+                continue
+            img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            ih_i, iw_i = img_rgb.shape[:2]
+
+            sx = best_img_x[mask]; sy = best_img_y[mask]
+            x0 = np.clip(sx.astype(int), 0, iw_i - 2)
+            y0 = np.clip(sy.astype(int), 0, ih_i - 2)
+            xf = sx - x0; yf = sy - y0
+
+            sampled = (img_rgb[y0,   x0  ] * ((1-xf)*(1-yf))[:, None] +
+                       img_rgb[y0,   x0+1] * (   xf *(1-yf))[:, None] +
+                       img_rgb[y0+1, x0  ] * ((1-xf)*   yf )[:, None] +
+                       img_rgb[y0+1, x0+1] * (   xf *   yf )[:, None])
+            result_rgb[mask] = sampled
+            logging.info(f'[{tag}] Sampled {mask.sum()} texels from {c["name"]}')
+
+        # ── Compose final texture + inpaint empty regions ──────────────
+        result = np.zeros((tex_size, tex_size, 3), dtype=np.uint8)
+        has_cam = best_cam_id >= 0
+        result[valid_tv[has_cam], valid_tu[has_cam]] = \
+            (result_rgb[has_cam] * 255).clip(0, 255).astype(np.uint8)
+
+        inpaint_mask = (~has_data).astype(np.uint8) * 255
+        no_cam_tv = valid_tv[~has_cam]; no_cam_tu = valid_tu[~has_cam]
+        if len(no_cam_tv):
+            inpaint_mask[no_cam_tv, no_cam_tu] = 255
         if inpaint_mask.any():
             result = cv2.inpaint(result, inpaint_mask, 5, cv2.INPAINT_TELEA)
 
-        painted_pct = has_w.sum() / has_data.sum() * 100 if has_data.sum() > 0 else 0
-        logging.info(f'[{tag}] Photo bake complete: {painted_pct:.1f}% of UV covered by photos')
+        pct = has_cam.sum() / M * 100
+        logging.info(f'[{tag}] Photo bake complete: {pct:.1f}% of UV painted from photos')
         return Image.fromarray(result)
 
     except Exception:
