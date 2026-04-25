@@ -198,6 +198,13 @@ def run_pipeline(job_id, image_dir, job_dir):
              '--max_image_size', str(MAX_DIM)],
             0.38, 'Undistorting images…')
 
+        # 4b — Convert undistorted sparse model to text format (COLMAP 3.9 defaults to binary)
+        run(['colmap', 'model_converter',
+             '--input_path', os.path.join(dense, 'sparse'),
+             '--output_path', os.path.join(dense, 'sparse'),
+             '--output_type', 'TXT'],
+            0.40, 'Converting camera model to text…')
+
         # 5 — Dense stereo (GPU accelerated)
         run(['colmap', 'patch_match_stereo',
              '--workspace_path', dense,
