@@ -28,11 +28,13 @@ os.makedirs(JOBS_DIR, exist_ok=True)
 
 # ── Check GPU availability at startup ────────────────────────────────
 def check_gpu():
-    r = subprocess.run(['colmap', 'feature_extractor', '--help'], capture_output=True, text=True)
-    # Also check nvidia-smi
-    gpu = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-                         capture_output=True, text=True)
-    gpu_name = gpu.stdout.strip() if gpu.returncode == 0 else 'No GPU detected'
+    try:
+        gpu = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                             capture_output=True, text=True)
+        gpu_name = gpu.stdout.strip() if gpu.returncode == 0 else 'No GPU detected'
+    except Exception:
+        gpu_name = 'No GPU detected'
+        gpu = type('r', (), {'returncode': 1})()
     logging.info(f'GPU: {gpu_name}')
     return gpu.returncode == 0, gpu_name
 
