@@ -315,12 +315,11 @@ def run_pipeline(job_id, image_dir, job_dir):
         densities = np.asarray(densities)
         logging.info(f'[{tag}] Poisson raw: {len(mesh.vertices)} verts, {len(mesh.triangles)} tris')
 
-        # Density trim — removes truly hallucinated geometry (near-zero density).
-        # q=0.05 is conservative: only removes the absolute bottom 5% density
-        # which is the pure hallucination, keeping all real scan boundaries.
-        density_threshold = np.quantile(densities, 0.05)
-        mesh.remove_vertices_by_mask(densities < density_threshold)
-        logging.info(f'[{tag}] After density trim (q=0.30): {len(mesh.triangles)} tris')
+        # No density trim — keep the full watertight Poisson mesh.
+        # Trimming created holes → holes created hundreds of UV island fragments.
+        # A closed watertight mesh produces far fewer UV islands → clean texture.
+        # The unscanned back gets black (inpainted) texture, which is fine.
+        logging.info(f'[{tag}] Poisson mesh (no trim): {len(mesh.triangles)} tris')
 
         # Smooth surface (Taubin preserves shape, Laplacian would shrink it)
         mesh = mesh.filter_smooth_taubin(number_of_iterations=10)
@@ -356,14 +355,37 @@ def run_pipeline(job_id, image_dir, job_dir):
         if len(faces) < 100:
             raise RuntimeError('Mesh too small after cleanup — take more overlapping photos.')
 
-        # ── Step 9: UV unwrap with xatlas (no overlapping UVs) ──────
-        set_job(job_id, 'processing', 0.76, 'UV unwrapping (xatlas)…')
+        # ── Step 9: Cylindrical UV projection ───────────────────────────
+        # For a limb scan, cylindrical UV creates one seamless "skin-peel"
+        # texture map — no island seams on the scanned surface.
+        # u = angle around the limb axis (front=0.5, back=0/1 = seam)
+        # v = position along the limb axis (wrist→elbow or ankle→knee)
+        # The seam falls at the back of the limb (unscanned side), so the
+        # front surface has zero seams — exactly like Blender "Cylinder UV".
+        set_job(job_id, 'processing', 0.76, 'UV projection (cylindrical)…')
 
-        vmapping, new_faces, uvs = xatlas.parametrize(verts, faces)
-        new_verts = verts[vmapping]
-        logging.info(f'[{tag}] xatlas: {len(new_verts)} verts, {len(new_faces)} tris, '
-                     f'UV range u=[{uvs[:,0].min():.3f},{uvs[:,0].max():.3f}] '
-                     f'v=[{uvs[:,1].min():.3f},{uvs[:,1].max():.3f}]')
+        # PCA to find limb axis (longest dimension)
+        centroid_m = verts.mean(axis=0)
+        centered_m = verts - centroid_m
+        _, eigvecs_m = np.linalg.eigh(centered_m.T @ centered_m)
+        limb_axis = eigvecs_m[:, -1]           # principal axis = along the limb
+        perp1     = eigvecs_m[:, -2]           # secondary axis = "front" reference
+        perp2     = np.cross(limb_axis, perp1)
+        perp2    /= np.linalg.norm(perp2) + 1e-10
+
+        # Cylindrical coords per vertex
+        proj_along = centered_m @ limb_axis
+        radial     = centered_m - proj_along[:, None] * limb_axis
+
+        u_angle = np.arctan2(radial @ perp2, radial @ perp1)
+        u_uv    = (u_angle / (2 * np.pi) + 0.5) % 1.0          # [0,1], front≈0.5
+        v_uv    = (proj_along - proj_along.min()) / (proj_along.ptp() + 1e-10)
+
+        uvs      = np.stack([u_uv, v_uv], axis=1).astype(np.float32)
+        new_verts = verts
+        new_faces = faces
+        logging.info(f'[{tag}] Cylindrical UV: u=[{u_uv.min():.3f},{u_uv.max():.3f}] '
+                     f'v=[{v_uv.min():.3f},{v_uv.max():.3f}]')
 
         # ── Step 10: Bake texture from photos using COLMAP camera poses ──
         # This projects the original photos onto the UV map — same as Blender's
@@ -563,6 +585,11 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
                 continue
             n = n / n_len
 
+            # Skip triangles that cross the cylindrical seam (u jumps from ~1→~0).
+            # These are on the back of the limb (unscanned) — inpainting covers them.
+            if max(uv0[0], uv1[0], uv2[0]) - min(uv0[0], uv1[0], uv2[0]) > 0.5:
+                continue
+
             # UV → pixel coords (flip V: UV origin bottom-left, image origin top-left)
             px = np.array([
                 [uv0[0] * tex_size, (1 - uv0[1]) * tex_size],
@@ -618,21 +645,15 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
         M = len(valid_tv)
         logging.info(f'[{tag}] UV rasterised: {M} texels')
 
-        # ── Find UV islands (connected components of the rasterised UV) ──
-        # Each UV island gets ONE camera for its entire surface.
-        # This eliminates colour seams inside islands — the same approach
-        # used by Reality Capture, Meshroom, and colmap-texture.
-        num_islands, island_map = cv2.connectedComponents(has_data.astype(np.uint8))
-        island_ids = island_map[valid_tv, valid_tu]   # (M,) island index per texel
-        logging.info(f'[{tag}] UV has {num_islands - 1} islands')
-
-        # ── Pass 1: score each (island, camera) pair (no image I/O) ────
-        # For every texel visible from a camera, add its dot-product score
-        # to that (island, camera) bucket. Best score per island wins.
-        # Also cache per-texel pixel coords for every camera (used in 1b).
-        island_cam_score = np.zeros((num_islands, len(cam_list)), dtype=np.float64)
-        all_img_x = np.zeros((M, len(cam_list)), dtype=np.float32)
-        all_img_y = np.zeros((M, len(cam_list)), dtype=np.float32)
+        # ── Pass 1: per-texel best-camera selection (no image I/O) ────────
+        # With cylindrical UV the entire scanned surface is one continuous
+        # region, so we use per-texel selection: each pixel independently
+        # picks the camera with the highest viewing-angle dot product.
+        # Camera transitions are gradual around the limb → no abrupt seams.
+        best_score  = np.full(M, -1.0, dtype=np.float64)
+        best_img_x  = np.zeros(M,      dtype=np.float64)
+        best_img_y  = np.zeros(M,      dtype=np.float64)
+        best_cam_id = np.full(M, -1,   dtype=np.int32)
 
         for ci, c in enumerate(cam_list):
             R, t = c['R'], c['t']
@@ -653,28 +674,16 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             dot = np.einsum('ij,ij->i', valid_n,
                             vd / (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10))
 
-            visible = in_front & in_bounds & (dot > 0.1)
-            np.add.at(island_cam_score[:, ci], island_ids[visible], dot[visible])
-
-            all_img_x[:, ci] = img_x.astype(np.float32)
-            all_img_y[:, ci] = img_y.astype(np.float32)
-
-        # Per island: camera with highest accumulated score wins
-        island_best = np.argmax(island_cam_score, axis=1)     # (num_islands,)
-        island_best[island_cam_score.max(axis=1) <= 0] = -1   # no camera covers island
-
-        # Map each texel → its island's best camera, and look up its pixel coords
-        best_cam_id = island_best[island_ids].astype(np.int32)
-        cam_idx_safe = np.clip(best_cam_id, 0, len(cam_list) - 1)
-        best_img_x = all_img_x[np.arange(M), cam_idx_safe].astype(np.float64)
-        best_img_y = all_img_y[np.arange(M), cam_idx_safe].astype(np.float64)
-        best_cam_id[island_ids == 0] = -1   # background pixels have no camera
-        del all_img_x, all_img_y            # free ~(M × N_cams × 8 bytes) memory
+            improve = in_front & in_bounds & (dot > 0.1) & (dot > best_score)
+            if improve.any():
+                best_score [improve] = dot  [improve]
+                best_img_x [improve] = img_x[improve]
+                best_img_y [improve] = img_y[improve]
+                best_cam_id[improve] = ci
 
         claimed = (best_cam_id >= 0).sum()
-        n_covered = int((island_best >= 0).sum())
-        logging.info(f'[{tag}] Island assignment: {n_covered}/{num_islands-1} islands '
-                     f'covered → {claimed}/{M} texels ({claimed/M*100:.1f}%)')
+        logging.info(f'[{tag}] Per-texel selection: {claimed}/{M} texels '
+                     f'assigned ({claimed/M*100:.1f}%)')
         if claimed == 0:
             logging.warning(f'[{tag}] No texels claimed by any camera')
             return None
