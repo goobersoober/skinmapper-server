@@ -620,89 +620,180 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
         M = len(valid_tv)
         logging.info(f'[{tag}] UV rasterised: {M} texels')
 
-        # ── Pass 1: per-texel best-camera selection (no image I/O) ────────
-        # With cylindrical UV the entire scanned surface is one continuous
-        # region, so we use per-texel selection: each pixel independently
-        # picks the camera with the highest viewing-angle dot product.
-        # Camera transitions are gradual around the limb → no abrupt seams.
-        best_score  = np.full(M, -1.0, dtype=np.float64)
-        best_img_x  = np.zeros(M,      dtype=np.float64)
-        best_img_y  = np.zeros(M,      dtype=np.float64)
-        best_cam_id = np.full(M, -1,   dtype=np.int32)
+        # ── Pass 1 — geometry only, no image I/O ───────────────────────
+        # Goals:
+        #   A. Per-UV-island camera assignment: every texel in an island
+        #      uses the SAME camera → zero colour switching mid-island.
+        #   B. Cache every camera's pixel coords per texel so Pass 2
+        #      doesn't need to reproject.
+        #   C. Count texels per camera to identify the dominant (reference)
+        #      camera for colour normalisation.
+        #
+        # Why per-island (not per-texel)?
+        #   Per-texel switches cameras frequently across a curved surface.
+        #   Each switch = a visible seam if cameras differ in exposure/WB.
+        #   Per-island = the entire UV patch is one photo crop → seamless
+        #   within the patch, same as how RC / Meshroom bake textures.
+
+        # --- Find UV islands (connected components of rasterised UV) ---
+        num_islands, island_map = cv2.connectedComponents(has_data.astype(np.uint8))
+        island_ids = island_map[valid_tv, valid_tu]   # (M,) — island per texel
+        logging.info(f'[{tag}] xatlas UV has {num_islands - 1} islands')
+
+        # --- Project all cameras, accumulate per-island scores ----------
+        island_cam_score = np.zeros((num_islands, len(cam_list)), dtype=np.float64)
+        cam_texel_count  = np.zeros(len(cam_list), dtype=np.int64)
+
+        # Store pixel coords for every (texel, camera) — used in Pass 2.
+        # Shape: (M, N_cams). For typical M≈1M and N_cams≈20 → ~80 MB, fine.
+        all_img_x = np.zeros((M, len(cam_list)), dtype=np.float32)
+        all_img_y = np.zeros((M, len(cam_list)), dtype=np.float32)
 
         for ci, c in enumerate(cam_list):
-            R, t = c['R'], c['t']
-            cam  = c['cam']
+            R, t   = c['R'], c['t']
+            cam    = c['cam']
             cam_pos = -R.T @ t
 
             pts_cam  = (R @ valid_pos.T).T + t
             in_front = pts_cam[:, 2] > 0.01
 
-            fx, fy, cx, cy = cam['fx'], cam['fy'], cam['cx'], cam['cy']
+            fx, fy, cx_c, cy_c = cam['fx'], cam['fy'], cam['cx'], cam['cy']
             iw, ih = cam['w'], cam['h']
             iz    = np.where(in_front, 1.0 / (pts_cam[:, 2] + 1e-10), 0.0)
-            img_x = fx * pts_cam[:, 0] * iz + cx
-            img_y = fy * pts_cam[:, 1] * iz + cy
+            img_x = fx * pts_cam[:, 0] * iz + cx_c
+            img_y = fy * pts_cam[:, 1] * iz + cy_c
 
-            in_bounds = (img_x >= 0) & (img_x < iw - 1) & (img_y >= 0) & (img_y < ih - 1)
+            in_bounds = (img_x >= 0) & (img_x < iw - 1) & \
+                        (img_y >= 0) & (img_y < ih - 1)
             vd  = cam_pos - valid_pos
             dot = np.einsum('ij,ij->i', valid_n,
                             vd / (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10))
 
-            improve = in_front & in_bounds & (dot > 0.1) & (dot > best_score)
-            if improve.any():
-                best_score [improve] = dot  [improve]
-                best_img_x [improve] = img_x[improve]
-                best_img_y [improve] = img_y[improve]
-                best_cam_id[improve] = ci
+            visible = in_front & in_bounds & (dot > 0.1)
+            np.add.at(island_cam_score[:, ci], island_ids[visible], dot[visible])
+            cam_texel_count[ci] = int(visible.sum())
+
+            all_img_x[:, ci] = img_x.astype(np.float32)
+            all_img_y[:, ci] = img_y.astype(np.float32)
+
+        # --- Per island: assign the camera with the highest total score --
+        island_best = np.argmax(island_cam_score, axis=1)        # (num_islands,)
+        island_best[island_cam_score.max(axis=1) <= 0] = -1      # uncovered islands
+
+        best_cam_id  = island_best[island_ids].astype(np.int32)  # (M,)
+        cam_idx_safe = np.clip(best_cam_id, 0, len(cam_list) - 1)
+        best_img_x   = all_img_x[np.arange(M), cam_idx_safe].astype(np.float64)
+        best_img_y   = all_img_y[np.arange(M), cam_idx_safe].astype(np.float64)
+        best_cam_id[island_ids == 0] = -1   # background texels
+        del all_img_x, all_img_y
 
         claimed = (best_cam_id >= 0).sum()
-        logging.info(f'[{tag}] Per-texel selection: {claimed}/{M} texels '
-                     f'assigned ({claimed/M*100:.1f}%)')
+        logging.info(f'[{tag}] Island assignment: {(island_best>=0).sum()}/'
+                     f'{num_islands-1} islands → {claimed}/{M} texels '
+                     f'({claimed/M*100:.1f}%)')
         if claimed == 0:
-            logging.warning(f'[{tag}] No texels claimed by any camera')
+            logging.warning(f'[{tag}] No texels claimed')
             return None
 
-        # ── Pass 2: sample from the winning camera (load each image once) ──
+        # ── Pass 2 — load images, colour-normalise, sample ─────────────
+        # Why colour normalisation?
+        #   Different photos have different exposures / white-balances.
+        #   Without correction, the boundary between two island-cameras
+        #   is visible as a colour step even though the seam is geometrically
+        #   correct. Normalising all cameras to the same statistics removes
+        #   that step.
+        #
+        # Method: match each camera's per-channel mean + std to the
+        # dominant camera (the one assigned the most texels = best-lit,
+        # most face-on). This is the standard approach in remote sensing
+        # and photogrammetry for multi-image colour balancing.
+
+        ref_ci  = int(cam_texel_count.argmax())
+        ref_img = cv2.cvtColor(cv2.imread(cam_list[ref_ci]['path']),
+                               cv2.COLOR_BGR2RGB).astype(np.float32)
+        # Compute reference stats on skin pixels only (not pure black/white)
+        ref_flat = ref_img.reshape(-1, 3)
+        skin_mask = (ref_flat.max(axis=1) > 20) & (ref_flat.max(axis=1) < 250)
+        ref_mean = ref_flat[skin_mask].mean(axis=0) if skin_mask.sum() > 100 \
+                   else ref_flat.mean(axis=0)
+        ref_std  = ref_flat[skin_mask].std(axis=0)  + 1e-6 if skin_mask.sum() > 100 \
+                   else ref_flat.std(axis=0) + 1e-6
+        logging.info(f'[{tag}] Colour ref: {cam_list[ref_ci]["name"]} '
+                     f'mean={ref_mean.round(1)} std={ref_std.round(1)}')
+
         result_rgb = np.zeros((M, 3), dtype=np.float32)
 
         for ci, c in enumerate(cam_list):
             mask = best_cam_id == ci
             if not mask.any():
                 continue
+
             img_bgr = cv2.imread(c['path'])
             if img_bgr is None:
                 continue
-            img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            ih_i, iw_i = img_rgb.shape[:2]
+            img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
 
+            # Colour normalisation: shift + scale per channel so this
+            # camera's skin statistics match the reference camera.
+            flat = img.reshape(-1, 3)
+            sk   = (flat.max(axis=1) > 20) & (flat.max(axis=1) < 250)
+            if sk.sum() > 100:
+                c_mean = flat[sk].mean(axis=0)
+                c_std  = flat[sk].std(axis=0) + 1e-6
+            else:
+                c_mean = flat.mean(axis=0)
+                c_std  = flat.std(axis=0) + 1e-6
+            img_norm = ((img - c_mean) / c_std * ref_std + ref_mean)
+            img_norm = np.clip(img_norm, 0, 255)
+
+            ih_i, iw_i = img_norm.shape[:2]
             sx = best_img_x[mask]; sy = best_img_y[mask]
             x0 = np.clip(sx.astype(int), 0, iw_i - 2)
             y0 = np.clip(sy.astype(int), 0, ih_i - 2)
             xf = sx - x0; yf = sy - y0
 
-            sampled = (img_rgb[y0,   x0  ] * ((1-xf)*(1-yf))[:, None] +
-                       img_rgb[y0,   x0+1] * (   xf *(1-yf))[:, None] +
-                       img_rgb[y0+1, x0  ] * ((1-xf)*   yf )[:, None] +
-                       img_rgb[y0+1, x0+1] * (   xf *   yf )[:, None])
-            result_rgb[mask] = sampled
-            logging.info(f'[{tag}] Sampled {mask.sum()} texels from {c["name"]}')
+            sampled = (img_norm[y0,   x0  ] * ((1-xf)*(1-yf))[:, None] +
+                       img_norm[y0,   x0+1] * (   xf *(1-yf))[:, None] +
+                       img_norm[y0+1, x0  ] * ((1-xf)*   yf )[:, None] +
+                       img_norm[y0+1, x0+1] * (   xf *   yf )[:, None])
+            result_rgb[mask] = sampled / 255.0
+            logging.info(f'[{tag}] {c["name"]}: {mask.sum()} texels '
+                         f'(norm mean {c_mean.round(0)}→{ref_mean.round(0)})')
 
-        # ── Compose final texture + inpaint empty regions ──────────────
+        # ── Compose + seam feathering + inpaint ────────────────────────
         result = np.zeros((tex_size, tex_size, 3), dtype=np.uint8)
         has_cam = best_cam_id >= 0
         result[valid_tv[has_cam], valid_tu[has_cam]] = \
             (result_rgb[has_cam] * 255).clip(0, 255).astype(np.uint8)
 
+        # Seam feathering: blend a narrow band (~5 px) at island boundaries
+        # so any residual colour step after normalisation is smoothed out.
+        # We detect seams by finding has_data pixels whose neighbourhood
+        # contains a different island label, then Gaussian-blur just those.
+        cam_label = np.full((tex_size, tex_size), -1, dtype=np.int32)
+        cam_label[valid_tv[has_cam], valid_tu[has_cam]] = best_cam_id[has_cam]
+        kern = np.ones((9, 9), np.uint8)
+        seam = np.zeros((tex_size, tex_size), dtype=bool)
+        for ci in range(len(cam_list)):
+            m = (cam_label == ci).astype(np.uint8)
+            if not m.any():
+                continue
+            eroded = cv2.erode(m, kern)
+            seam  |= (m.astype(bool)) & (~eroded.astype(bool))
+        if seam.any():
+            blurred = cv2.GaussianBlur(result, (0, 0), 3.0)
+            result[seam] = blurred[seam]
+
+        # Inpaint any remaining uncovered UV pixels
         inpaint_mask = (~has_data).astype(np.uint8) * 255
-        no_cam_tv = valid_tv[~has_cam]; no_cam_tu = valid_tu[~has_cam]
-        if len(no_cam_tv):
-            inpaint_mask[no_cam_tv, no_cam_tu] = 255
+        no_cam_pix   = valid_tv[~has_cam], valid_tu[~has_cam]
+        if len(no_cam_pix[0]):
+            inpaint_mask[no_cam_pix] = 255
         if inpaint_mask.any():
             result = cv2.inpaint(result, inpaint_mask, 5, cv2.INPAINT_TELEA)
 
         pct = has_cam.sum() / M * 100
-        logging.info(f'[{tag}] Photo bake complete: {pct:.1f}% of UV painted from photos')
+        logging.info(f'[{tag}] Bake complete: {pct:.1f}% of UV from photos')
         return Image.fromarray(result)
 
     except Exception:
