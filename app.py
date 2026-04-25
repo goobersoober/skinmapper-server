@@ -1069,7 +1069,7 @@ def handle_exception(e):
 @app.route('/health')
 def health():
     cleanup_old_jobs()
-    colmap_ok = shutil.which('colmap') is not None
+    colmap_ok = shutil.which('colmap') is not None or os.path.isfile('/usr/local/bin/colmap')
     try:
         import open3d; o3d_ok = True
     except ImportError:
