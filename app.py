@@ -233,7 +233,6 @@ def run_pipeline(job_id, image_dir, job_dir):
         set_job(job_id, 'processing', 0.66, 'Loading point cloud…')
         import open3d as o3d
         import numpy as np
-        import trimesh
         import xatlas
         import cv2
         from scipy.spatial import cKDTree
