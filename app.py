@@ -276,29 +276,62 @@ def run_pipeline(job_id, image_dir, job_dir):
         pcd_points = np.asarray(pcd.points)
         pcd_colors = np.asarray(pcd.colors) if pcd.has_colors() else None
 
-        # ── Step 8: Surface reconstruction ───────────────────────────
-        set_job(job_id, 'processing', 0.72, 'Creating surface…')
+        # ── Step 8: Surface reconstruction (Poisson + cleanup) ──────
+        # Poisson creates a smooth continuous watertight surface.
+        # The "back" of the limb (unscanned) gets hallucinated, but has very
+        # low density — we remove it via aggressive density trimming.
+        # This gives a clean continuous topology, equivalent to Blender's
+        # Quadraflow remesh in the manual workflow.
+        set_job(job_id, 'processing', 0.71, 'Estimating normals…')
 
+        # Estimate and orient normals (critical for Poisson quality)
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30))
-        pcd.orient_normals_consistent_tangent_plane(30)
+        # Orient normals using the centroid as a reference (away from inside)
+        # This works better than tangent plane for partial-wrap scans
+        centroid = np.asarray(pcd.points).mean(axis=0)
+        pts_arr2 = np.asarray(pcd.points)
+        normals_arr = np.asarray(pcd.normals)
+        # For a body part scan, normals should point AWAY from the scanned axis
+        # Compute axis (longest dimension via SVD)
+        centered = pts_arr2 - centroid
+        cov = centered.T @ centered
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        axis = eigvecs[:, -1]  # principal axis (longest dim - the limb direction)
+        # Project to plane perpendicular to axis to get radial outward direction
+        radial = centered - (centered @ axis)[:, None] * axis
+        radial_len = np.linalg.norm(radial, axis=1, keepdims=True) + 1e-10
+        radial_dir = radial / radial_len
+        # Flip normals that point inward (toward centroid)
+        flip_mask = np.einsum('ij,ij->i', normals_arr, radial_dir) < 0
+        normals_arr[flip_mask] = -normals_arr[flip_mask]
+        pcd.normals = o3d.utility.Vector3dVector(normals_arr)
+        logging.info(f'[{tag}] Oriented {flip_mask.sum()}/{len(normals_arr)} normals outward')
 
-        # Ball-pivoting: only creates triangles where points exist
-        nn_dists = np.asarray(pcd.compute_nearest_neighbor_distance())
-        avg_dist = np.mean(nn_dists)
-        radii = [avg_dist * 1.5, avg_dist * 3, avg_dist * 6]
-        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-            pcd, o3d.utility.DoubleVector(radii))
-        logging.info(f'[{tag}] Ball-pivot: {len(mesh.vertices)} verts, {len(mesh.triangles)} tris')
+        set_job(job_id, 'processing', 0.73, 'Creating surface (Poisson)…')
 
-        # Fallback to Poisson if ball-pivoting produces too little
-        if len(mesh.triangles) < 500:
-            logging.info(f'[{tag}] Ball-pivot insufficient, using Poisson')
-            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
-            densities = np.asarray(densities)
-            # Aggressive trim: remove bottom 15% by density (phantom surfaces)
-            mesh.remove_vertices_by_mask(densities < np.quantile(densities, 0.15))
+        # Poisson reconstruction with depth=9 (good detail without huge memory)
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=9, scale=1.1, linear_fit=False)
+        densities = np.asarray(densities)
+        logging.info(f'[{tag}] Poisson raw: {len(mesh.vertices)} verts, {len(mesh.triangles)} tris')
 
-        # Remove small disconnected pieces
+        # Aggressive density trim — kills the hallucinated back surface.
+        # For a half-wrap scan, the unscanned side has near-zero density.
+        density_threshold = np.quantile(densities, 0.30)
+        mesh.remove_vertices_by_mask(densities < density_threshold)
+        logging.info(f'[{tag}] After density trim (q=0.30): {len(mesh.triangles)} tris')
+
+        # Smooth surface (Taubin preserves shape, Laplacian would shrink it)
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=10)
+        logging.info(f'[{tag}] Smoothed (Taubin x10)')
+
+        # Cleanup non-manifold artifacts
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+
+        # Keep only largest connected component (drops floating fragments)
         tri_clusters, tri_counts, _ = mesh.cluster_connected_triangles()
         tri_clusters = np.asarray(tri_clusters)
         tri_counts = np.asarray(tri_counts)
@@ -306,19 +339,21 @@ def run_pipeline(job_id, image_dir, job_dir):
             keep = tri_clusters == tri_counts.argmax()
             mesh.remove_triangles_by_mask(~keep)
             mesh.remove_unreferenced_vertices()
-            logging.info(f'[{tag}] Kept largest component: {len(mesh.triangles)} tris')
+            logging.info(f'[{tag}] Kept largest component: {len(mesh.triangles)} tris '
+                         f'(of {len(tri_counts)} components)')
 
-        # Decimate to reasonable size
-        target_tris = min(50000, len(mesh.triangles))
+        # Decimate to ~30K tris — fewer triangles = fewer UV islands = better photo bake
+        target_tris = min(30000, len(mesh.triangles))
         if len(mesh.triangles) > target_tris:
             mesh = mesh.simplify_quadric_decimation(target_tris)
-        mesh.compute_vertex_normals()
+            logging.info(f'[{tag}] Decimated to: {len(mesh.triangles)} tris')
 
+        mesh.compute_vertex_normals()
         verts = np.asarray(mesh.vertices).astype(np.float32)
         faces = np.asarray(mesh.triangles).astype(np.uint32)
         logging.info(f'[{tag}] Final mesh: {len(verts)} verts, {len(faces)} tris')
-        if len(faces) == 0:
-            raise RuntimeError('Mesh generation failed — try more overlapping photos.')
+        if len(faces) < 100:
+            raise RuntimeError('Mesh too small after cleanup — take more overlapping photos.')
 
         # ── Step 9: UV unwrap with xatlas (no overlapping UVs) ──────
         set_job(job_id, 'processing', 0.76, 'UV unwrapping (xatlas)…')
