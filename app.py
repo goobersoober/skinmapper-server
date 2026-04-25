@@ -250,16 +250,20 @@ def run_pipeline(job_id, image_dir, job_dir):
             pcd = pcd.voxel_down_sample(0.003)
             logging.info(f'[{tag}] After voxel downsample: {len(pcd.points)} points')
 
-        # DBSCAN: keep only the largest cluster (body part vs background)
-        pts_arr = np.asarray(pcd.points)
-        nn_dists = np.asarray(pcd.compute_nearest_neighbor_distance())
-        eps = np.median(nn_dists) * 5
-        labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=20, print_progress=False))
+        # DBSCAN: remove isolated noise, keep all substantial clusters
+        # Use larger eps to avoid over-fragmenting the limb surface
+        nn_dists_arr = np.asarray(pcd.compute_nearest_neighbor_distance())
+        eps = np.mean(nn_dists_arr) * 15  # mean*15 keeps limb together; median*5 was too small
+        labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=10, print_progress=False))
         if labels.max() >= 0:
             counts = np.bincount(labels[labels >= 0])
-            largest = np.argmax(counts)
-            pcd = pcd.select_by_index(np.where(labels == largest)[0])
-            logging.info(f'[{tag}] Largest cluster: {len(pcd.points)} pts ({len(counts)} clusters)')
+            largest_count = counts.max()
+            # Keep all clusters that are at least 5% the size of the largest
+            # (limb may fragment slightly at edges — keep all meaningful pieces)
+            keep_ids = np.where(counts >= max(50, largest_count * 0.05))[0]
+            keep_mask = np.isin(labels, keep_ids)
+            pcd = pcd.select_by_index(np.where(keep_mask)[0])
+            logging.info(f'[{tag}] DBSCAN: kept {keep_mask.sum()} pts across {len(keep_ids)} clusters (of {len(counts)} total, eps={eps:.4f})')
 
         # Save colors for later
         pcd_points = np.asarray(pcd.points)
@@ -309,35 +313,40 @@ def run_pipeline(job_id, image_dir, job_dir):
         if len(faces) == 0:
             raise RuntimeError('Mesh generation failed — try more overlapping photos.')
 
-        # ── Step 9: Transfer vertex colors from point cloud ──────────
-        set_job(job_id, 'processing', 0.76, 'Coloring mesh…')
-
-        if pcd_colors is not None and len(pcd_colors) > 0:
-            tree = cKDTree(pcd_points)
-            _, idx = tree.query(verts, k=3)
-            vertex_colors = (pcd_colors[idx].mean(axis=1) * 255).clip(0, 255).astype(np.uint8)
-            logging.info(f'[{tag}] Vertex colors: shape={vertex_colors.shape}')
-        else:
-            vertex_colors = np.full((len(verts), 3), 180, dtype=np.uint8)
-            logging.warning(f'[{tag}] No point cloud colors — using placeholder')
-
-        # ── Step 10: UV unwrap with xatlas (no overlapping UVs) ──────
-        set_job(job_id, 'processing', 0.80, 'UV unwrapping (xatlas)…')
+        # ── Step 9: UV unwrap with xatlas (no overlapping UVs) ──────
+        set_job(job_id, 'processing', 0.76, 'UV unwrapping (xatlas)…')
 
         vmapping, new_faces, uvs = xatlas.parametrize(verts, faces)
-        # xatlas splits vertices at seams → remap colors
         new_verts = verts[vmapping]
-        new_colors = vertex_colors[vmapping]
         logging.info(f'[{tag}] xatlas: {len(new_verts)} verts, {len(new_faces)} tris, '
                      f'UV range u=[{uvs[:,0].min():.3f},{uvs[:,0].max():.3f}] '
                      f'v=[{uvs[:,1].min():.3f},{uvs[:,1].max():.3f}]')
 
-        # ── Step 11: Bake vertex colors → texture via rasterization ──
-        set_job(job_id, 'processing', 0.85, 'Baking texture…')
+        # ── Step 10: Bake texture from photos using COLMAP camera poses ──
+        # This projects the original photos onto the UV map — same as Blender's
+        # "Selected to Active" bake. Gives photographic-quality textures.
+        set_job(job_id, 'processing', 0.82, 'Baking texture from photos…')
         TEX_SIZE = 2048
-        texture = bake_vertex_colors_to_texture(
-            new_verts, new_faces, uvs, new_colors, TEX_SIZE, tag
+        dense_sparse = os.path.join(dense, 'sparse')
+        undistorted_images = os.path.join(dense, 'images')
+
+        texture = bake_texture_from_photos(
+            new_verts, new_faces, uvs,
+            undistorted_images, dense_sparse,
+            TEX_SIZE, tag
         )
+
+        # Fallback: if photo bake failed, use vertex colors from point cloud
+        if texture is None:
+            logging.warning(f'[{tag}] Photo bake failed, falling back to vertex colors')
+            set_job(job_id, 'processing', 0.85, 'Baking texture (fallback)…')
+            if pcd_colors is not None and len(pcd_colors) > 0:
+                tree = cKDTree(pcd_points)
+                _, idx = tree.query(new_verts, k=3)
+                new_colors = (pcd_colors[idx].mean(axis=1) * 255).clip(0, 255).astype(np.uint8)
+            else:
+                new_colors = np.full((len(new_verts), 3), 180, dtype=np.uint8)
+            texture = bake_vertex_colors_to_texture(new_verts, new_faces, uvs, new_colors, TEX_SIZE, tag)
 
         # ── Step 12: Normalize scale + export ────────────────────────
         set_job(job_id, 'processing', 0.92, 'Packaging result…')
@@ -380,6 +389,257 @@ def run_pipeline(job_id, image_dir, job_dir):
         for f in [db, os.path.join(job_dir, 'dense.ply')]:
             try: os.remove(f)
             except: pass
+
+
+# ── Photo-based texture baking using COLMAP camera poses ─────────────
+
+def _read_colmap_cameras_txt(path):
+    """Parse cameras.txt → dict of camera_id → intrinsics."""
+    cameras = {}
+    if not os.path.exists(path):
+        return cameras
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            p = line.split()
+            if len(p) < 5:
+                continue
+            cam_id = int(p[0])
+            model = p[1]
+            w, h = int(p[2]), int(p[3])
+            params = [float(x) for x in p[4:]]
+            # Map all COLMAP camera models to fx,fy,cx,cy
+            if model == 'SIMPLE_PINHOLE':
+                fx = fy = params[0]; cx = params[1]; cy = params[2]
+            elif model == 'PINHOLE':
+                fx = params[0]; fy = params[1]; cx = params[2]; cy = params[3]
+            elif model in ('SIMPLE_RADIAL', 'RADIAL'):
+                fx = fy = params[0]; cx = params[1]; cy = params[2]
+            elif model in ('OPENCV', 'FULL_OPENCV', 'OPENCV_FISHEYE'):
+                fx = params[0]; fy = params[1]; cx = params[2]; cy = params[3]
+            else:
+                fx = fy = params[0]
+                cx = params[1] if len(params) > 1 else w / 2
+                cy = params[2] if len(params) > 2 else h / 2
+            cameras[cam_id] = dict(fx=fx, fy=fy, cx=cx, cy=cy, w=w, h=h)
+    return cameras
+
+
+def _read_colmap_images_txt(path):
+    """Parse images.txt → list of dicts with R, t, camera_id, name."""
+    images = []
+    if not os.path.exists(path):
+        return images
+    with open(path) as f:
+        lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+    i = 0
+    while i < len(lines):
+        p = lines[i].split()
+        if len(p) < 9:
+            i += 1
+            continue
+        qw, qx, qy, qz = float(p[1]), float(p[2]), float(p[3]), float(p[4])
+        tx, ty, tz = float(p[5]), float(p[6]), float(p[7])
+        camera_id = int(p[8])
+        name = p[9] if len(p) > 9 else ''
+        # Quaternion → rotation matrix
+        R = np.array([
+            [1-2*(qy*qy+qz*qz),   2*(qx*qy-qw*qz),   2*(qx*qz+qw*qy)],
+            [  2*(qx*qy+qw*qz), 1-2*(qx*qx+qz*qz),   2*(qy*qz-qw*qx)],
+            [  2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx), 1-2*(qx*qx+qy*qy)]
+        ], dtype=np.float64)
+        images.append(dict(R=R, t=np.array([tx, ty, tz]), camera_id=camera_id, name=name))
+        i += 2  # skip the 2D point correspondences line
+    return images
+
+
+def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size, tag):
+    """
+    Project original photos onto the UV texture map using COLMAP camera poses.
+    This is equivalent to Blender's 'Selected to Active' diffuse bake:
+    for each UV texel, find its 3D world position, project into every camera,
+    sample the photo, and blend contributions weighted by face-to-camera angle.
+    Fully vectorised — processes one camera at a time.
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    try:
+        cameras = _read_colmap_cameras_txt(os.path.join(sparse_dir, 'cameras.txt'))
+        images  = _read_colmap_images_txt(os.path.join(sparse_dir, 'images.txt'))
+        if not cameras or not images:
+            logging.warning(f'[{tag}] No COLMAP cameras/images found — skipping photo bake')
+            return None
+        logging.info(f'[{tag}] Photo bake: {len(cameras)} cameras, {len(images)} images')
+
+        verts_np = np.array(verts, dtype=np.float64)   # (N,3)
+        faces_np = np.array(faces, dtype=np.int32)     # (F,3)
+        uvs_np   = np.array(uvs,   dtype=np.float32)   # (N,2)
+
+        # ── Build UV→3D position map (one-time, vectorised per triangle) ──
+        pos_map    = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+        normal_map = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+        has_data   = np.zeros((tex_size, tex_size),    dtype=bool)
+
+        v0_all = verts_np[faces_np[:, 0]]
+        v1_all = verts_np[faces_np[:, 1]]
+        v2_all = verts_np[faces_np[:, 2]]
+
+        for fi in range(len(faces_np)):
+            v0, v1, v2 = v0_all[fi], v1_all[fi], v2_all[fi]
+            uv0 = uvs_np[faces_np[fi, 0]]
+            uv1 = uvs_np[faces_np[fi, 1]]
+            uv2 = uvs_np[faces_np[fi, 2]]
+
+            edge1 = v1 - v0; edge2 = v2 - v0
+            n = np.cross(edge1, edge2)
+            n_len = np.linalg.norm(n)
+            if n_len < 1e-10:
+                continue
+            n = n / n_len
+
+            # UV → pixel coords (flip V: UV origin=bottom-left, image origin=top-left)
+            px = np.array([
+                [uv0[0] * tex_size, (1 - uv0[1]) * tex_size],
+                [uv1[0] * tex_size, (1 - uv1[1]) * tex_size],
+                [uv2[0] * tex_size, (1 - uv2[1]) * tex_size],
+            ], dtype=np.float32)
+
+            min_u = max(0, int(px[:, 0].min()) - 1)
+            max_u = min(tex_size - 1, int(px[:, 0].max()) + 1)
+            min_v = max(0, int(px[:, 1].min()) - 1)
+            max_v = min(tex_size - 1, int(px[:, 1].max()) + 1)
+            if max_u <= min_u or max_v <= min_v:
+                continue
+
+            # Vectorised barycentric over bounding-box pixels
+            us = np.arange(min_u, max_u + 1, dtype=np.float32) + 0.5
+            vs = np.arange(min_v, max_v + 1, dtype=np.float32) + 0.5
+            uu, vv = np.meshgrid(us, vs)
+
+            p0, p1, p2 = px[0], px[1], px[2]
+            def cross2d(ax, ay, bx, by):
+                return ax * by - ay * bx
+
+            d_x = uu - p0[0]; d_y = vv - p0[1]
+            d1_x = p1[0]-p0[0]; d1_y = p1[1]-p0[1]
+            d2_x = p2[0]-p0[0]; d2_y = p2[1]-p0[1]
+            denom = d1_x*d2_y - d1_y*d2_x
+            if abs(denom) < 1e-6:
+                continue
+
+            w1 = (d_x*d2_y - d_y*d2_x) / denom
+            w2 = (d1_x*d_y - d1_y*d_x) / denom
+            w0 = 1.0 - w1 - w2
+            inside = (w0 >= -0.01) & (w1 >= -0.01) & (w2 >= -0.01)
+            if not inside.any():
+                continue
+
+            w0c = np.clip(w0, 0, 1); w1c = np.clip(w1, 0, 1); w2c = np.clip(w2, 0, 1)
+            ws  = w0c + w1c + w2c + 1e-10
+            w0c /= ws; w1c /= ws; w2c /= ws
+
+            pos3d = (w0c[..., None]*v0 + w1c[..., None]*v1 + w2c[..., None]*v2).astype(np.float32)
+
+            tv = np.clip((vv - 0.5).astype(int), 0, tex_size-1)
+            tu = np.clip((uu - 0.5).astype(int), 0, tex_size-1)
+            pos_map   [tv[inside], tu[inside]] = pos3d[inside]
+            normal_map[tv[inside], tu[inside]] = n.astype(np.float32)
+            has_data  [tv[inside], tu[inside]] = True
+
+        valid_tv, valid_tu = np.where(has_data)
+        if len(valid_tv) == 0:
+            logging.warning(f'[{tag}] UV position map empty')
+            return None
+
+        valid_pos = pos_map[valid_tv, valid_tu].astype(np.float64)      # (M,3)
+        valid_n   = normal_map[valid_tv, valid_tu].astype(np.float64)   # (M,3)
+
+        tex_accum    = np.zeros((tex_size, tex_size, 3), dtype=np.float64)
+        weight_accum = np.zeros((tex_size, tex_size),    dtype=np.float64)
+
+        # ── Per-camera: project, sample, accumulate ────────────────────
+        for img_info in images:
+            img_path = os.path.join(image_dir, img_info['name'])
+            if not os.path.exists(img_path):
+                continue
+            img_bgr = cv2.imread(img_path)
+            if img_bgr is None:
+                continue
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            ih, iw = img_rgb.shape[:2]
+
+            cam = cameras.get(img_info['camera_id'])
+            if cam is None:
+                continue
+
+            R = img_info['R']
+            t = img_info['t']
+            cam_pos = (-R.T @ t)                               # world-space camera centre
+
+            # Project all valid 3D points into this camera (vectorised)
+            pts_cam = (R @ valid_pos.T).T + t                 # (M,3)
+            in_front = pts_cam[:, 2] > 0.01
+
+            fx, fy, cx, cy = cam['fx'], cam['fy'], cam['cx'], cam['cy']
+            iz = np.where(in_front, 1.0 / (pts_cam[:, 2] + 1e-10), 0.0)
+            img_x = fx * pts_cam[:, 0] * iz + cx
+            img_y = fy * pts_cam[:, 1] * iz + cy
+
+            in_bounds = (img_x >= 0) & (img_x < iw - 1) & (img_y >= 0) & (img_y < ih - 1)
+
+            # Angle weight: dot(face_normal, view_direction)
+            vd = cam_pos - valid_pos
+            vd_len = np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10
+            vd_n = vd / vd_len
+            dot = np.einsum('ij,ij->i', valid_n, vd_n)
+
+            mask = in_front & in_bounds & (dot > 0.1)
+            if not mask.any():
+                continue
+
+            sx = img_x[mask]; sy = img_y[mask]; w = dot[mask]
+            x0 = sx.astype(int); y0 = sy.astype(int)
+            x0 = np.clip(x0, 0, iw - 2); y0 = np.clip(y0, 0, ih - 2)
+            xf = sx - x0; yf = sy - y0
+
+            # Bilinear sample
+            colors = (img_rgb[y0,   x0  ] * ((1-xf)*(1-yf))[:, None] +
+                      img_rgb[y0,   x0+1] * (   xf *(1-yf))[:, None] +
+                      img_rgb[y0+1, x0  ] * ((1-xf)*   yf )[:, None] +
+                      img_rgb[y0+1, x0+1] * (   xf *   yf )[:, None])  # (K,3)
+
+            ty_m = valid_tv[mask]; tx_m = valid_tu[mask]
+            np.add.at(tex_accum[:, :, 0], (ty_m, tx_m), colors[:, 0] * w)
+            np.add.at(tex_accum[:, :, 1], (ty_m, tx_m), colors[:, 1] * w)
+            np.add.at(tex_accum[:, :, 2], (ty_m, tx_m), colors[:, 2] * w)
+            np.add.at(weight_accum,       (ty_m, tx_m), w)
+
+            logging.info(f'[{tag}] Photo bake cam {img_info["name"]}: {mask.sum()} texels')
+
+        # ── Normalise and inpaint ──────────────────────────────────────
+        has_w = weight_accum > 0
+        if not has_w.any():
+            logging.warning(f'[{tag}] Photo bake produced no texels')
+            return None
+
+        result = np.zeros((tex_size, tex_size, 3), dtype=np.uint8)
+        result[has_w] = (tex_accum[has_w] / weight_accum[has_w, None] * 255).clip(0, 255).astype(np.uint8)
+
+        inpaint_mask = (~has_data | ~has_w).astype(np.uint8) * 255
+        if inpaint_mask.any():
+            result = cv2.inpaint(result, inpaint_mask, 5, cv2.INPAINT_TELEA)
+
+        painted_pct = has_w.sum() / has_data.sum() * 100 if has_data.sum() > 0 else 0
+        logging.info(f'[{tag}] Photo bake complete: {painted_pct:.1f}% of UV covered by photos')
+        return Image.fromarray(result)
+
+    except Exception:
+        logging.error(f'[{tag}] Photo bake error: {traceback.format_exc()}')
+        return None
 
 
 # ── Texture baking (vertex colors → UV texture via rasterization) ────
