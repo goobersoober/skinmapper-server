@@ -355,37 +355,17 @@ def run_pipeline(job_id, image_dir, job_dir):
         if len(faces) < 100:
             raise RuntimeError('Mesh too small after cleanup — take more overlapping photos.')
 
-        # ── Step 9: Cylindrical UV projection ───────────────────────────
-        # For a limb scan, cylindrical UV creates one seamless "skin-peel"
-        # texture map — no island seams on the scanned surface.
-        # u = angle around the limb axis (front=0.5, back=0/1 = seam)
-        # v = position along the limb axis (wrist→elbow or ankle→knee)
-        # The seam falls at the back of the limb (unscanned side), so the
-        # front surface has zero seams — exactly like Blender "Cylinder UV".
-        set_job(job_id, 'processing', 0.76, 'UV projection (cylindrical)…')
+        # ── Step 9: UV unwrap with xatlas ───────────────────────────────
+        # xatlas handles any body part shape (arms, legs, hands, shoulders).
+        # With a watertight Poisson mesh (no holes), xatlas produces far
+        # fewer UV islands than before — no hole-edges to fragment on.
+        set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
 
-        # PCA to find limb axis (longest dimension)
-        centroid_m = verts.mean(axis=0)
-        centered_m = verts - centroid_m
-        _, eigvecs_m = np.linalg.eigh(centered_m.T @ centered_m)
-        limb_axis = eigvecs_m[:, -1]           # principal axis = along the limb
-        perp1     = eigvecs_m[:, -2]           # secondary axis = "front" reference
-        perp2     = np.cross(limb_axis, perp1)
-        perp2    /= np.linalg.norm(perp2) + 1e-10
-
-        # Cylindrical coords per vertex
-        proj_along = centered_m @ limb_axis
-        radial     = centered_m - proj_along[:, None] * limb_axis
-
-        u_angle = np.arctan2(radial @ perp2, radial @ perp1)
-        u_uv    = (u_angle / (2 * np.pi) + 0.5) % 1.0          # [0,1], front≈0.5
-        v_uv    = (proj_along - proj_along.min()) / (proj_along.ptp() + 1e-10)
-
-        uvs      = np.stack([u_uv, v_uv], axis=1).astype(np.float32)
-        new_verts = verts
-        new_faces = faces
-        logging.info(f'[{tag}] Cylindrical UV: u=[{u_uv.min():.3f},{u_uv.max():.3f}] '
-                     f'v=[{v_uv.min():.3f},{v_uv.max():.3f}]')
+        vmapping, new_faces, uvs = xatlas.parametrize(verts, faces)
+        new_verts = verts[vmapping]
+        logging.info(f'[{tag}] xatlas: {len(new_verts)} verts, {len(new_faces)} tris, '
+                     f'UV range u=[{uvs[:,0].min():.3f},{uvs[:,0].max():.3f}] '
+                     f'v=[{uvs[:,1].min():.3f},{uvs[:,1].max():.3f}]')
 
         # ── Step 10: Bake texture from photos using COLMAP camera poses ──
         # This projects the original photos onto the UV map — same as Blender's
@@ -584,11 +564,6 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             if n_len < 1e-10:
                 continue
             n = n / n_len
-
-            # Skip triangles that cross the cylindrical seam (u jumps from ~1→~0).
-            # These are on the back of the limb (unscanned) — inpainting covers them.
-            if max(uv0[0], uv1[0], uv2[0]) - min(uv0[0], uv1[0], uv2[0]) > 0.5:
-                continue
 
             # UV → pixel coords (flip V: UV origin bottom-left, image origin top-left)
             px = np.array([
