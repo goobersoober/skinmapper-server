@@ -404,31 +404,60 @@ def run_pipeline(job_id, image_dir, job_dir):
         if len(faces) < 100:
             raise RuntimeError('Mesh too small — try more overlapping photos.')
 
-        # ── Step 9: UV unwrap with xatlas (relaxed chart options) ──────
-        # Default xatlas max_cost=2.0 creates ~1000 islands on a curved arm.
-        # max_cost=8.0 allows more UV stretch per chart → 10-30 islands.
-        # Fewer islands = fewer seam boundaries = clean printable texture.
+        # ── Step 9: UV unwrap ───────────────────────────────────────────
+        # Auto-detect limb vs compact shape via PCA eigenvalue ratio.
+        # Elongated (ratio > 4): cylindrical "skin-peel" UV — one continuous
+        #   rectangle, u = angle around limb, v = along limb axis.
+        #   Like Blender's Smart UV Project: peel the limb flat and print.
+        # Compact (ratio ≤ 4): xatlas island-based UV (hands, torso patches).
         set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
 
-        try:
-            _atlas = xatlas.Atlas()
-            _atlas.add_mesh(verts, faces)
-            _co = xatlas.ChartOptions()
-            _co.max_cost = 8.0              # default 2.0 → 1000+ islands; 8.0 → ~20 islands
-            _co.normal_deviation_weight = 0.5  # less sensitive to normal changes
-            _po = xatlas.PackOptions()
-            _po.resolution = 2048
-            _po.padding = 2
-            _atlas.generate(chart_options=_co, pack_options=_po)
-            vmapping, new_faces, uvs = _atlas[0]
-        except Exception as _xe:
-            logging.warning(f'[{tag}] xatlas Atlas API unavailable ({_xe}), using parametrize')
-            vmapping, new_faces, uvs = xatlas.parametrize(verts, faces)
+        _cov_verts = verts - verts.mean(axis=0)
+        _eigvals, _eigvecs = np.linalg.eigh(_cov_verts.T @ _cov_verts)
+        _elongation = float(_eigvals[-1] / (_eigvals[-2] + 1e-10))
+        logging.info(f'[{tag}] PCA elongation ratio: {_elongation:.2f}')
+        USE_CYLINDRICAL = _elongation > 4.0
 
-        new_verts = verts[vmapping]
-        logging.info(f'[{tag}] xatlas: {len(new_verts)} verts, {len(new_faces)} tris, '
-                     f'UV range u=[{uvs[:,0].min():.3f},{uvs[:,0].max():.3f}] '
-                     f'v=[{uvs[:,1].min():.3f},{uvs[:,1].max():.3f}]')
+        if USE_CYLINDRICAL:
+            logging.info(f'[{tag}] Elongated shape (ratio={_elongation:.1f}) → '
+                         f'cylindrical skin-peel UV')
+            # Principal axis = limb long axis (last eigenvector = largest eigenvalue)
+            limb_axis = _eigvecs[:, -1]
+            perp1     = _eigvecs[:, -2]
+            perp2     = np.cross(limb_axis, perp1)
+            perp2    /= np.linalg.norm(perp2) + 1e-10
+
+            proj_along = _cov_verts @ limb_axis
+            radial     = _cov_verts - proj_along[:, None] * limb_axis
+            # u: angle around limb (0–1), v: position along limb (0–1)
+            u_uv = (np.arctan2(radial @ perp2, radial @ perp1) / (2 * np.pi) + 0.5) % 1.0
+            v_uv = (proj_along - proj_along.min()) / (proj_along.ptp() + 1e-10)
+            uvs       = np.stack([u_uv, v_uv], axis=1).astype(np.float32)
+            new_verts = verts
+            new_faces = faces
+            logging.info(f'[{tag}] Cylindrical UV: u=[{u_uv.min():.3f},{u_uv.max():.3f}] '
+                         f'v=[{v_uv.min():.3f},{v_uv.max():.3f}]')
+        else:
+            logging.info(f'[{tag}] Compact shape (ratio={_elongation:.1f}) → xatlas UV')
+            try:
+                _atlas = xatlas.Atlas()
+                _atlas.add_mesh(verts, faces)
+                _co = xatlas.ChartOptions()
+                _co.max_cost = 8.0
+                _co.normal_deviation_weight = 0.5
+                _po = xatlas.PackOptions()
+                _po.resolution = 2048
+                _po.padding = 2
+                _atlas.generate(chart_options=_co, pack_options=_po)
+                vmapping, new_faces, uvs = _atlas[0]
+            except Exception as _xe:
+                logging.warning(f'[{tag}] xatlas Atlas API unavailable ({_xe}), '
+                                f'using parametrize')
+                vmapping, new_faces, uvs = xatlas.parametrize(verts, faces)
+            new_verts = verts[vmapping]
+            logging.info(f'[{tag}] xatlas: {len(new_verts)} verts, {len(new_faces)} tris, '
+                         f'UV range u=[{uvs[:,0].min():.3f},{uvs[:,0].max():.3f}] '
+                         f'v=[{uvs[:,1].min():.3f},{uvs[:,1].max():.3f}]')
 
         # ── Step 10: Bake texture from photos using COLMAP camera poses ──
         # This projects the original photos onto the UV map — same as Blender's
@@ -441,7 +470,8 @@ def run_pipeline(job_id, image_dir, job_dir):
         texture = bake_texture_from_photos(
             new_verts, new_faces, uvs,
             undistorted_images, dense_sparse,
-            TEX_SIZE, tag
+            TEX_SIZE, tag,
+            use_cylindrical=USE_CYLINDRICAL
         )
 
         # Fallback: if photo bake failed, use vertex colors from point cloud
@@ -564,14 +594,19 @@ def _read_colmap_images_txt(path):
     return images
 
 
-def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size, tag):
+def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size, tag,
+                             use_cylindrical=False):
     """
     Project original photos onto the UV texture map using COLMAP camera poses.
 
-    Uses per-texel BEST-CAMERA selection: for each UV pixel, pick the single
-    camera with the highest face-to-camera dot product (most face-on view).
-    This prevents color mixing between cameras (which causes the mosaic artefact)
-    and matches how Reality Capture / Meshroom bake textures.
+    use_cylindrical=True  (limb scans): per-TEXEL best-camera selection.
+      The cylindrical UV is one continuous surface — different cameras cover
+      different sides of the limb, so each texel independently picks the
+      most face-on camera. Seam-crossing triangles are skipped in rasterisation.
+
+    use_cylindrical=False (compact shapes): per-ISLAND best-camera selection.
+      Entire UV islands use the same camera → zero colour switching mid-island.
+      Matches how Reality Capture / Meshroom bake textures.
 
     Two-pass approach (no redundant image I/O):
       Pass 1 — geometry only: determine which camera wins each texel.
@@ -621,6 +656,14 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             uv0 = uvs_np[faces_np[fi, 0]]
             uv1 = uvs_np[faces_np[fi, 1]]
             uv2 = uvs_np[faces_np[fi, 2]]
+
+            # Cylindrical UV: skip triangles that straddle the u=0/u=1 seam.
+            # Their UV coordinates jump from ~0 to ~1 in u, making a huge
+            # triangle across the whole texture — skip those.
+            if use_cylindrical:
+                u_vals = (uv0[0], uv1[0], uv2[0])
+                if max(u_vals) - min(u_vals) > 0.5:
+                    continue
 
             n = np.cross(v1 - v0, v2 - v0)
             n_len = np.linalg.norm(n)
@@ -684,37 +727,34 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
         logging.info(f'[{tag}] UV rasterised: {M} texels')
 
         # ── Pass 1 — geometry only, no image I/O ───────────────────────
-        # Goals:
-        #   A. Per-UV-island camera assignment: every texel in an island
-        #      uses the SAME camera → zero colour switching mid-island.
-        #   B. Cache every camera's pixel coords per texel so Pass 2
-        #      doesn't need to reproject.
-        #   C. Count texels per camera to identify the dominant (reference)
-        #      camera for colour normalisation.
-        #
-        # Why per-island (not per-texel)?
-        #   Per-texel switches cameras frequently across a curved surface.
-        #   Each switch = a visible seam if cameras differ in exposure/WB.
-        #   Per-island = the entire UV patch is one photo crop → seamless
-        #   within the patch, same as how RC / Meshroom bake textures.
+        # For cylindrical UV (one continuous surface):
+        #   Per-TEXEL selection — each texel picks the most face-on camera.
+        #   Different cameras cover front/back/sides of the limb; per-texel
+        #   ensures every part of the skin uses the sharpest available photo.
+        # For island UV (xatlas, compact shapes):
+        #   Per-ISLAND selection — whole island uses the same camera → no
+        #   colour switching mid-patch (same as RC / Meshroom bake).
 
-        # --- Find UV islands (connected components of rasterised UV) ---
-        num_islands, island_map = cv2.connectedComponents(has_data.astype(np.uint8))
-        island_ids = island_map[valid_tv, valid_tu]   # (M,) — island per texel
-        logging.info(f'[{tag}] xatlas UV has {num_islands - 1} islands')
+        cam_texel_count = np.zeros(len(cam_list), dtype=np.int64)
 
-        # --- Project all cameras, accumulate per-island scores ----------
-        island_cam_score = np.zeros((num_islands, len(cam_list)), dtype=np.float64)
-        cam_texel_count  = np.zeros(len(cam_list), dtype=np.int64)
-
-        # Store pixel coords for every (texel, camera) — used in Pass 2.
-        # Shape: (M, N_cams). For typical M≈1M and N_cams≈20 → ~80 MB, fine.
+        # Storage for pixel coords (M × N_cams) — used in Pass 2
         all_img_x = np.zeros((M, len(cam_list)), dtype=np.float32)
         all_img_y = np.zeros((M, len(cam_list)), dtype=np.float32)
 
+        if use_cylindrical:
+            # Per-texel: track best camera score for each texel individually
+            texel_best_score = np.full(M, -np.inf, dtype=np.float64)
+            texel_best_cam   = np.full(M, -1, dtype=np.int32)
+        else:
+            # Per-island: connected components → aggregate scores per island
+            num_islands, island_map = cv2.connectedComponents(has_data.astype(np.uint8))
+            island_ids = island_map[valid_tv, valid_tu]  # (M,) — island per texel
+            logging.info(f'[{tag}] UV has {num_islands - 1} islands')
+            island_cam_score = np.zeros((num_islands, len(cam_list)), dtype=np.float64)
+
         for ci, c in enumerate(cam_list):
-            R, t   = c['R'], c['t']
-            cam    = c['cam']
+            R, t    = c['R'], c['t']
+            cam     = c['cam']
             cam_pos = -R.T @ t
 
             pts_cam  = (R @ valid_pos.T).T + t
@@ -733,27 +773,45 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
                             vd / (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10))
 
             visible = in_front & in_bounds & (dot > 0.1)
-            np.add.at(island_cam_score[:, ci], island_ids[visible], dot[visible])
             cam_texel_count[ci] = int(visible.sum())
+
+            if use_cylindrical:
+                # Per-texel: update where this camera has the best view angle
+                better = visible & (dot > texel_best_score)
+                texel_best_score[better] = dot[better]
+                texel_best_cam[better]   = ci
+            else:
+                # Per-island: accumulate total dot score into each island
+                np.add.at(island_cam_score[:, ci], island_ids[visible], dot[visible])
 
             all_img_x[:, ci] = img_x.astype(np.float32)
             all_img_y[:, ci] = img_y.astype(np.float32)
 
-        # --- Per island: assign the camera with the highest total score --
-        island_best = np.argmax(island_cam_score, axis=1)        # (num_islands,)
-        island_best[island_cam_score.max(axis=1) <= 0] = -1      # uncovered islands
+        # --- Resolve best camera per texel --------------------------------
+        if use_cylindrical:
+            best_cam_id  = texel_best_cam                                   # (M,)
+            cam_idx_safe = np.clip(best_cam_id, 0, len(cam_list) - 1)
+            best_img_x   = all_img_x[np.arange(M), cam_idx_safe].astype(np.float64)
+            best_img_y   = all_img_y[np.arange(M), cam_idx_safe].astype(np.float64)
+            best_cam_id[texel_best_score < 0] = -1   # no camera covered this texel
+            del all_img_x, all_img_y
+            claimed = (best_cam_id >= 0).sum()
+            logging.info(f'[{tag}] Cylindrical per-texel: {claimed}/{M} texels '
+                         f'({claimed/M*100:.1f}%) covered')
+        else:
+            island_best = np.argmax(island_cam_score, axis=1)      # (num_islands,)
+            island_best[island_cam_score.max(axis=1) <= 0] = -1    # uncovered islands
+            best_cam_id  = island_best[island_ids].astype(np.int32)
+            cam_idx_safe = np.clip(best_cam_id, 0, len(cam_list) - 1)
+            best_img_x   = all_img_x[np.arange(M), cam_idx_safe].astype(np.float64)
+            best_img_y   = all_img_y[np.arange(M), cam_idx_safe].astype(np.float64)
+            best_cam_id[island_ids == 0] = -1   # background texels
+            del all_img_x, all_img_y
+            claimed = (best_cam_id >= 0).sum()
+            logging.info(f'[{tag}] Island assignment: {(island_best>=0).sum()}/'
+                         f'{num_islands-1} islands → {claimed}/{M} texels '
+                         f'({claimed/M*100:.1f}%)')
 
-        best_cam_id  = island_best[island_ids].astype(np.int32)  # (M,)
-        cam_idx_safe = np.clip(best_cam_id, 0, len(cam_list) - 1)
-        best_img_x   = all_img_x[np.arange(M), cam_idx_safe].astype(np.float64)
-        best_img_y   = all_img_y[np.arange(M), cam_idx_safe].astype(np.float64)
-        best_cam_id[island_ids == 0] = -1   # background texels
-        del all_img_x, all_img_y
-
-        claimed = (best_cam_id >= 0).sum()
-        logging.info(f'[{tag}] Island assignment: {(island_best>=0).sum()}/'
-                     f'{num_islands-1} islands → {claimed}/{M} texels '
-                     f'({claimed/M*100:.1f}%)')
         if claimed == 0:
             logging.warning(f'[{tag}] No texels claimed')
             return None
