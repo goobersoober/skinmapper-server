@@ -315,45 +315,73 @@ def run_pipeline(job_id, image_dir, job_dir):
         densities = np.asarray(densities)
         logging.info(f'[{tag}] Poisson raw: {len(mesh.vertices)} verts, {len(mesh.triangles)} tris')
 
-        # No density trim — keep the full watertight Poisson mesh.
-        # Trimming created holes → holes created hundreds of UV island fragments.
-        # A closed watertight mesh produces far fewer UV islands → clean texture.
-        # The unscanned back gets black (inpainted) texture, which is fine.
-        logging.info(f'[{tag}] Poisson mesh (no trim): {len(mesh.triangles)} tris')
+        logging.info(f'[{tag}] Poisson raw: {len(mesh.triangles)} tris')
 
-        # Smooth surface (Taubin preserves shape, Laplacian would shrink it)
+        # ── Point-cloud guided trimming ─────────────────────────────────
+        # THE correct way to separate arm from background/floor.
+        # Density trimming uses Poisson reconstruction density — a mesh
+        # artefact that doesn't reliably distinguish arm vs floor.
+        # This method asks: "is this face near any REAL scan point?"
+        # Floor/table faces are far from arm scan points → removed.
+        # Arm faces are always within a few mm of real data → kept.
+        # Uses IQR outlier detection so it adapts to any scan geometry.
+        set_job(job_id, 'processing', 0.73, 'Removing background…')
+
+        v_arr = np.asarray(mesh.vertices)
+        f_arr = np.asarray(mesh.triangles)
+        centroids = (v_arr[f_arr[:, 0]] + v_arr[f_arr[:, 1]] + v_arr[f_arr[:, 2]]) / 3
+        dists, _ = cKDTree(pcd_points).query(centroids)
+
+        # IQR outlier detection: faces with distance > Q3 + 1.5*IQR are background
+        q1, q3 = np.percentile(dists, [25, 75])
+        iqr_thresh = q3 + 1.5 * (q3 - q1)
+        bg_mask = dists > iqr_thresh
+        mesh.remove_triangles_by_mask(bg_mask)
+        mesh.remove_unreferenced_vertices()
+        logging.info(f'[{tag}] Point-cloud trim: removed {bg_mask.sum()} background faces, '
+                     f'{len(mesh.triangles)} remain (IQR threshold={iqr_thresh:.4f}m)')
+
+        # Smooth before fill/cleanup so normals are coherent
         mesh = mesh.filter_smooth_taubin(number_of_iterations=10)
-        logging.info(f'[{tag}] Smoothed (Taubin x10)')
 
-        # Cleanup non-manifold artifacts
+        # Fill small holes left by trimming (e.g. narrow scan gaps)
+        # hole_size cap prevents filling the large intentional openings
+        # (wrist/ankle end of the scan)
+        try:
+            mesh = mesh.fill_holes(hole_size=300)
+        except Exception:
+            pass  # fill_holes may not be available in older Open3D builds
+
+        # Standard mesh cleanup
         mesh.remove_degenerate_triangles()
         mesh.remove_duplicated_triangles()
         mesh.remove_duplicated_vertices()
         mesh.remove_non_manifold_edges()
 
-        # Keep only largest connected component (drops floating fragments)
+        # Keep only largest connected component
         tri_clusters, tri_counts, _ = mesh.cluster_connected_triangles()
         tri_clusters = np.asarray(tri_clusters)
-        tri_counts = np.asarray(tri_counts)
+        tri_counts   = np.asarray(tri_counts)
         if len(tri_counts) > 1:
             keep = tri_clusters == tri_counts.argmax()
             mesh.remove_triangles_by_mask(~keep)
             mesh.remove_unreferenced_vertices()
             logging.info(f'[{tag}] Kept largest component: {len(mesh.triangles)} tris '
-                         f'(of {len(tri_counts)} components)')
+                         f'(of {len(tri_counts)} total)')
 
-        # Decimate to ~30K tris — fewer triangles = fewer UV islands = better photo bake
+        # Decimate to 30K, then re-smooth to remove crease artefacts from
+        # decimation (crease edges cause xatlas to create extra islands)
         target_tris = min(30000, len(mesh.triangles))
         if len(mesh.triangles) > target_tris:
             mesh = mesh.simplify_quadric_decimation(target_tris)
-            logging.info(f'[{tag}] Decimated to: {len(mesh.triangles)} tris')
-
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=5)
         mesh.compute_vertex_normals()
+
         verts = np.asarray(mesh.vertices).astype(np.float32)
         faces = np.asarray(mesh.triangles).astype(np.uint32)
         logging.info(f'[{tag}] Final mesh: {len(verts)} verts, {len(faces)} tris')
         if len(faces) < 100:
-            raise RuntimeError('Mesh too small after cleanup — take more overlapping photos.')
+            raise RuntimeError('Mesh too small — try more overlapping photos.')
 
         # ── Step 9: UV unwrap with xatlas ───────────────────────────────
         # xatlas handles any body part shape (arms, legs, hands, shoulders).
