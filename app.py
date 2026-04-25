@@ -375,11 +375,19 @@ def run_pipeline(job_id, image_dir, job_dir):
         except Exception:
             pass  # fill_holes may not be available in older Open3D builds
 
-        # Standard mesh cleanup
-        mesh.remove_degenerate_triangles()
-        mesh.remove_duplicated_triangles()
-        mesh.remove_duplicated_vertices()
-        mesh.remove_non_manifold_edges()
+        # Standard mesh cleanup — run twice: once before, once after hole-fill
+        def _clean_mesh(m):
+            m.remove_degenerate_triangles()
+            m.remove_duplicated_triangles()
+            m.remove_duplicated_vertices()
+            m.remove_non_manifold_edges()
+            try:
+                m = m.merge_close_vertices(0.001)  # weld verts within 1 mm
+            except Exception:
+                pass
+            return m
+
+        mesh = _clean_mesh(mesh)
 
         # Keep only largest connected component
         tri_clusters, tri_counts, _ = mesh.cluster_connected_triangles()
@@ -392,8 +400,10 @@ def run_pipeline(job_id, image_dir, job_dir):
             logging.info(f'[{tag}] Kept largest component: {len(mesh.triangles)} tris '
                          f'(of {len(tri_counts)} total)')
 
-        # Decimate to 30K, then re-smooth to remove crease artefacts from
-        # decimation (crease edges cause xatlas to create extra islands)
+        # Second cleanup pass after component selection
+        mesh = _clean_mesh(mesh)
+
+        # Decimate to 30K, then re-smooth to remove crease artefacts
         target_tris = min(30000, len(mesh.triangles))
         if len(mesh.triangles) > target_tris:
             mesh = mesh.simplify_quadric_decimation(target_tris)
@@ -418,7 +428,7 @@ def run_pipeline(job_id, image_dir, job_dir):
         _eigvals, _eigvecs = np.linalg.eigh(_cov_verts.T @ _cov_verts)
         _elongation = float(_eigvals[-1] / (_eigvals[-2] + 1e-10))
         logging.info(f'[{tag}] PCA elongation ratio: {_elongation:.2f}')
-        USE_CYLINDRICAL = _elongation > 4.0
+        USE_CYLINDRICAL = _elongation > 3.0
 
         if USE_CYLINDRICAL:
             logging.info(f'[{tag}] Elongated shape (ratio={_elongation:.1f}) → '
@@ -516,6 +526,22 @@ def run_pipeline(job_id, image_dir, job_dir):
             zf.write(tex_path, 'mesh.png')
 
         result_size = os.path.getsize(zip_path)
+
+        # ── Pipeline quality validation ─────────────────────────────────
+        tri_cl, tri_ct, _ = mesh.cluster_connected_triangles()
+        n_components = len(np.asarray(tri_ct))
+        uv_label = 'cylindrical (1 island)' if USE_CYLINDRICAL else 'xatlas'
+        logging.info(f'[{tag}] ── Pipeline quality summary ─────────────')
+        logging.info(f'[{tag}]   Mesh components : {n_components} (want 1)')
+        logging.info(f'[{tag}]   UV method       : {uv_label}')
+        logging.info(f'[{tag}]   Verts / tris    : {len(new_verts)} / {len(new_faces)}')
+        logging.info(f'[{tag}]   Texture size    : {TEX_SIZE}x{TEX_SIZE}')
+        logging.info(f'[{tag}]   Output zip      : {result_size} bytes')
+        if n_components > 1:
+            logging.warning(f'[{tag}]   !! Mesh has {n_components} components — '
+                            f'check RANSAC/IQR trim settings')
+        logging.info(f'[{tag}] ─────────────────────────────────────────')
+
         logging.info(f'[{tag}] Done! {len(mesh.vertices)} verts, {len(mesh.triangles)} tris, zip={result_size} bytes')
         set_job(job_id, 'done', 1.0, 'Reconstruction complete!',
                 result_url=f'/result/{job_id}')
@@ -907,15 +933,51 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             blurred = cv2.GaussianBlur(result, (0, 0), 3.0)
             result[seam] = blurred[seam]
 
-        # Inpaint any remaining uncovered UV pixels
+        # Inpaint any remaining uncovered UV pixels (no-camera areas within UV)
         inpaint_mask = (~has_data).astype(np.uint8) * 255
         no_cam_pix   = valid_tv[~has_cam], valid_tu[~has_cam]
         if len(no_cam_pix[0]):
             inpaint_mask[no_cam_pix] = 255
         if inpaint_mask.any():
-            result = cv2.inpaint(result, inpaint_mask, 5, cv2.INPAINT_TELEA)
+            result = cv2.inpaint(result, inpaint_mask, 15, cv2.INPAINT_TELEA)
 
+        # ── Texture edge dilation ───────────────────────────────────────
+        # Bleed filled pixels outward ~16px so UV island edges never sample
+        # black when the mesh is rendered (standard in all professional bakers).
+        dil_filled = has_data.copy()
+        dil_kern   = np.ones((3, 3), np.uint8)
+        for _ in range(8):
+            expanded = cv2.dilate(dil_filled.astype(np.uint8), dil_kern).astype(bool)
+            new_px   = expanded & ~dil_filled
+            if not new_px.any():
+                break
+            # Use weighted blur that only considers already-filled pixels
+            r_f  = result.astype(np.float32)
+            w    = dil_filled.astype(np.float32)
+            r_sum = cv2.blur(r_f,  (3, 3)) * 9
+            w_sum = cv2.blur(w,    (3, 3)) * 9
+            safe  = w_sum > 0.5
+            r_avg = np.where(safe[..., None],
+                             r_sum / np.maximum(w_sum[..., None], 1), 0
+                             ).clip(0, 255).astype(np.uint8)
+            result[new_px] = r_avg[new_px]
+            dil_filled |= new_px
+
+        # ── Quality validation ──────────────────────────────────────────
         pct = has_cam.sum() / M * 100
+        if use_cylindrical:
+            uv_mode = 'cylindrical (1 island)'
+        else:
+            n_isl = num_islands - 1
+            uv_mode = f'xatlas ({n_isl} islands)'
+        logging.info(f'[{tag}] ── Quality report ──────────────────────')
+        logging.info(f'[{tag}]   UV mode       : {uv_mode}')
+        logging.info(f'[{tag}]   Texels covered: {pct:.1f}%')
+        logging.info(f'[{tag}]   Dilation done : 8 passes (~16px bleed)')
+        if pct < 50:
+            logging.warning(f'[{tag}]   !! Low coverage — check mesh/camera poses')
+        logging.info(f'[{tag}] ────────────────────────────────────────')
+
         logging.info(f'[{tag}] Bake complete: {pct:.1f}% of UV from photos')
         return Image.fromarray(result)
 
