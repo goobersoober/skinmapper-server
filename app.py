@@ -24,6 +24,12 @@ MAX_PHOTOS = 60
 JOB_TTL = 3600
 MAX_DIM = 1600  # COLMAP feature matching is sensitive to resolution — keep at proven value
 
+# Set FAST_MODE=1 on RunPod for quick test runs (lower res, faster turnaround ~4-5 min)
+# Set FAST_MODE=0 (or unset) for full quality production runs (~15-20 min)
+FAST_MODE = os.environ.get('FAST_MODE', '0') == '1'
+if FAST_MODE:
+    logging.info('FAST_MODE enabled — using reduced resolution for quick testing')
+
 os.makedirs(JOBS_DIR, exist_ok=True)
 
 # ── Check GPU availability at startup ────────────────────────────────
@@ -146,6 +152,22 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
     tag = job_id[:8]
     use_gpu = '1' if HAS_GPU else '0'
 
+    # Resolution parameters — scale down in fast mode for quick test iterations
+    _max_dim  = 800  if FAST_MODE else MAX_DIM   # COLMAP image size
+    _tex_size = 1024 if FAST_MODE else 4096       # texture atlas resolution
+    _p_depth  = 7    if FAST_MODE else 9          # Poisson depth (7≈fast, 9≈quality)
+    _max_pts  = 20_000 if FAST_MODE else 60_000   # max pts fed to Poisson
+    _tgt_tris = 15_000 if FAST_MODE else 50_000   # target triangle count after decimation
+    # Determine UV/trimming strategy from scan_type sent by iOS app
+    IS_PARTIAL_SCAN = scan_type != 'fullWrap'
+
+    if FAST_MODE:
+        logging.info(f'[{tag}] FAST_MODE: dim={_max_dim} tex={_tex_size} '
+                     f'depth={_p_depth} maxpts={_max_pts} tris={_tgt_tris}')
+    logging.info(f'[{tag}] scan_type={scan_type} body_part={body_part} → '
+                 f'{"PLANAR" if IS_PARTIAL_SCAN else "CYLINDRICAL"} UV, '
+                 f'trim={75 if IS_PARTIAL_SCAN else 85}th pct')
+
     try:
         db     = os.path.join(job_dir, 'db.db')
         sparse = os.path.join(job_dir, 'sparse')
@@ -203,8 +225,8 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
             try:
                 with Image.open(fpath) as im:
                     w, h = im.size
-                    if max(w, h) > MAX_DIM:
-                        scale = MAX_DIM / max(w, h)
+                    if max(w, h) > _max_dim:
+                        scale = _max_dim / max(w, h)
                         im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
                         im.save(fpath, quality=90)
             except Exception as e:
@@ -216,7 +238,7 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
              '--image_path', image_dir,
              '--ImageReader.single_camera', '1',
              '--SiftExtraction.use_gpu', '0',
-             '--SiftExtraction.max_image_size', str(MAX_DIM),
+             '--SiftExtraction.max_image_size', str(_max_dim),
              '--SiftExtraction.max_num_features', '8192'],
             0.08, 'Extracting features…')
 
@@ -273,7 +295,7 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
              '--input_path', sparse0,
              '--output_path', dense,
              '--output_type', 'COLMAP',
-             '--max_image_size', str(MAX_DIM)],
+             '--max_image_size', str(_max_dim)],
             0.38, 'Undistorting images…')
 
         # 4b — Convert undistorted sparse model to text format (COLMAP 3.9 defaults to binary)
@@ -288,7 +310,7 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
              '--workspace_path', dense,
              '--workspace_format', 'COLMAP',
              '--PatchMatchStereo.geom_consistency', 'true',
-             '--PatchMatchStereo.max_image_size', str(MAX_DIM)],
+             '--PatchMatchStereo.max_image_size', str(_max_dim)],
             0.52, 'Computing depth maps (GPU)…')
 
         # 6 — Fuse into dense point cloud
@@ -390,7 +412,7 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
         # Open3D Poisson is single-threaded; 120K+ points can take >10 min
         # and hit the gunicorn timeout. 60K is plenty of density for a limb
         # scan at Poisson depth=9 (voxel grid keeps point distribution even).
-        MAX_POISSON_PTS = 60_000
+        MAX_POISSON_PTS = _max_pts
         n_pts = len(pcd.points)
         if n_pts > MAX_POISSON_PTS:
             pts_np = np.asarray(pcd.points)
@@ -425,13 +447,17 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
 
         set_job(job_id, 'processing', 0.73, 'Creating surface (Poisson)…')
 
-        # Poisson reconstruction with depth=9 (good detail without huge memory)
+        # Poisson reconstruction — depth controls detail vs speed tradeoff
         mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=9, scale=1.1, linear_fit=False)
+            pcd, depth=_p_depth, scale=1.1, linear_fit=False)
         densities = np.asarray(densities)
         logging.info(f'[{tag}] Poisson raw: {len(mesh.vertices)} verts, {len(mesh.triangles)} tris')
 
-        logging.info(f'[{tag}] Poisson raw: {len(mesh.triangles)} tris')
+        # Make all face normals consistently outward-facing.
+        # Poisson can produce faces with inconsistent winding order — this causes
+        # the "shattered mirror" look in Procreate because some faces render inside-out.
+        mesh.orient_triangles()
+        mesh.compute_vertex_normals()
 
         # ── Point-cloud guided trimming + AGGRESSIVE topology repair ───
         # CRITICAL: previous IQR cut at 3.0×IQR was drilling swiss-cheese
@@ -450,12 +476,13 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
         # Per-VERTEX distance is smoother than per-face → fewer holes
         v_dists, _ = cKDTree(pcd_points).query(v_arr)
 
-        # Use 85th percentile — removes the Poisson-hallucinated back-of-limb
-        # surface (unscanned side has vertices far from any real scan point).
-        # 96th was too loose: back surface survived and produced geometric blobs
-        # in the texture. 85th cuts more but vertex-erosion below prevents holes
-        # in the actual scanned surface.
-        cutoff = float(np.percentile(v_dists, 85))
+        # Partial scans (front-only) have much more Poisson hallucination relative
+        # to real data — use 75th percentile to aggressively cut the unscanned sides.
+        # Full wraps have real data all around — 85th is safe.
+        # Vertex-erosion below prevents over-cutting into the real scanned surface.
+        _trim_pct = 75 if IS_PARTIAL_SCAN else 85
+        cutoff = float(np.percentile(v_dists, _trim_pct))
+        logging.info(f'[{tag}] Trim percentile: {_trim_pct}th ({"partial" if IS_PARTIAL_SCAN else "full"} scan)')
         # Floor it at 1cm so we never trim aggressively on very-clean scans
         cutoff = max(cutoff, 0.01)
         bad_v = v_dists > cutoff
@@ -484,8 +511,11 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
                      f'removed {int(bad_face.sum())}/{len(bad_face)} faces '
                      f'({bad_face.mean()*100:.1f}%), {len(mesh.triangles)} remain')
 
-        # Smooth BEFORE fill so the fill triangulation lays into coherent normals
-        mesh = mesh.filter_smooth_taubin(number_of_iterations=10)
+        # Smooth BEFORE fill so the fill triangulation lays into coherent normals.
+        # More iterations for partial scans — the trimmed boundary is jagged
+        # and needs extra smoothing to avoid saw-tooth edges.
+        _smooth_iters = 30 if IS_PARTIAL_SCAN else 20
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=_smooth_iters)
 
         # Standard cleanup helper
         def _clean_mesh(m):
@@ -548,11 +578,10 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
             pass
         mesh = _clean_mesh(mesh)
 
-        # Decimate (keep more detail than before — 50K instead of 30K)
-        target_tris = min(50000, len(mesh.triangles))
+        target_tris = min(_tgt_tris, len(mesh.triangles))
         if len(mesh.triangles) > target_tris:
             mesh = mesh.simplify_quadric_decimation(target_tris)
-        mesh = mesh.filter_smooth_taubin(number_of_iterations=5)
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=15)
         mesh.compute_vertex_normals()
 
         # Topology gate: log Euler characteristic + boundary count.
@@ -612,9 +641,7 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
         # cap       = shoulder/end cap      → planar UV
         # patch     = small area            → planar UV
         # backPanel = flat back area        → planar UV
-        IS_PARTIAL_SCAN = scan_type != 'fullWrap'
-        logging.info(f'[{tag}] scan_type={scan_type} body_part={body_part} → '
-                     f'{"PLANAR" if IS_PARTIAL_SCAN else "CYLINDRICAL"} UV')
+        # (IS_PARTIAL_SCAN set at top of run_pipeline from scan_type param)
 
         if IS_PARTIAL_SCAN:
             # ── Planar UV (correct for front-only / half scans) ─────────
@@ -687,7 +714,7 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
         # This projects the original photos onto the UV map — same as Blender's
         # "Selected to Active" bake. Gives photographic-quality textures.
         set_job(job_id, 'processing', 0.82, 'Baking texture from photos…')
-        TEX_SIZE = 4096  # bumped from 2048 — RTX 3090 has the headroom
+        TEX_SIZE = _tex_size
         dense_sparse = os.path.join(dense, 'sparse')
         undistorted_images = os.path.join(dense, 'images')
 
