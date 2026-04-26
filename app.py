@@ -22,7 +22,7 @@ MAX_CONCURRENT = 2
 MAX_QUEUE = 10
 MAX_PHOTOS = 60
 JOB_TTL = 3600
-MAX_DIM = 2400  # full resolution with GPU (bumped from 1600 for sharper textures)
+MAX_DIM = 1600  # COLMAP feature matching is sensitive to resolution — keep at proven value
 
 os.makedirs(JOBS_DIR, exist_ok=True)
 
@@ -199,11 +199,9 @@ def run_pipeline(job_id, image_dir, job_dir):
         if not imgs:
             raise RuntimeError('No valid images found')
 
-        # Downscale if needed + photo-quality filter (drop blurriest 20%)
+        # Downscale if needed
         set_job(job_id, 'processing', 0.03, 'Preparing images…')
         from PIL import Image
-        import cv2 as _cv2_pre
-        sharp_scores = {}
         for fname in imgs:
             fpath = os.path.join(image_dir, fname)
             try:
@@ -212,34 +210,9 @@ def run_pipeline(job_id, image_dir, job_dir):
                     if max(w, h) > MAX_DIM:
                         scale = MAX_DIM / max(w, h)
                         im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-                        im.save(fpath, quality=92)
-                # Laplacian variance = sharpness proxy (higher = sharper)
-                _g = _cv2_pre.imread(fpath, _cv2_pre.IMREAD_GRAYSCALE)
-                if _g is not None:
-                    sharp_scores[fname] = float(_cv2_pre.Laplacian(_g, _cv2_pre.CV_64F).var())
+                        im.save(fpath, quality=90)
             except Exception as e:
                 logging.warning(f'[{tag}] Resize {fname}: {e}')
-
-        # Drop the blurriest 20% IF we have ≥10 photos (need enough overlap)
-        if len(sharp_scores) >= 10:
-            scores_sorted = sorted(sharp_scores.values())
-            blur_cutoff = scores_sorted[max(1, int(len(scores_sorted) * 0.20))]
-            killed = []
-            for fname, s in sharp_scores.items():
-                if s < blur_cutoff:
-                    try:
-                        os.remove(os.path.join(image_dir, fname))
-                        killed.append((fname, s))
-                    except Exception:
-                        pass
-            if killed:
-                logging.info(f'[{tag}] Dropped {len(killed)} blurry photos '
-                             f'(Laplacian var < {blur_cutoff:.1f}): '
-                             + ', '.join(f'{n}({s:.0f})' for n, s in killed[:5])
-                             + (f', +{len(killed)-5} more' if len(killed) > 5 else ''))
-            imgs = [f for f in os.listdir(image_dir)
-                    if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-            logging.info(f'[{tag}] After blur filter: {len(imgs)} images')
 
         # 1 — Feature extraction (CPU — COLMAP's SiftGPU needs OpenGL display)
         run(['colmap', 'feature_extractor',
@@ -268,7 +241,35 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         sparse0 = os.path.join(sparse, '0')
         if not os.path.exists(sparse0):
-            raise RuntimeError('Could not reconstruct — take more overlapping photos with slow, steady movement.')
+            raise RuntimeError('Could not reconstruct — COLMAP could not register any cameras. Try again.')
+
+        # Count how many cameras COLMAP actually registered by reading images.bin/txt.
+        # If fewer than 8 succeeded we'll produce garbage — reject early with a
+        # clear error rather than delivering a yellow inpaint blob.
+        _img_bin = os.path.join(sparse0, 'images.bin')
+        _img_txt = os.path.join(sparse0, 'images.txt')
+        _n_registered = 0
+        try:
+            if os.path.exists(_img_bin):
+                # binary format: first 8 bytes = uint64 count
+                import struct as _struct
+                with open(_img_bin, 'rb') as _f:
+                    _n_registered = _struct.unpack('<Q', _f.read(8))[0]
+            elif os.path.exists(_img_txt):
+                with open(_img_txt) as _f:
+                    _n_registered = sum(
+                        1 for l in _f if l.strip() and not l.startswith('#')
+                            and len(l.split()) >= 9
+                    )
+        except Exception as _e:
+            logging.warning(f'[{tag}] Could not count registered cameras: {_e}')
+        logging.info(f'[{tag}] COLMAP registered {_n_registered} cameras')
+        if 0 < _n_registered < 8:
+            raise RuntimeError(
+                f'Only {_n_registered} of your photos could be matched '
+                f'(need at least 8). Move more slowly and keep the leg in '
+                f'frame throughout — do not change lighting mid-scan.'
+            )
 
         # 4 — Undistort images
         run(['colmap', 'image_undistorter',
@@ -320,8 +321,12 @@ def run_pipeline(job_id, image_dir, job_dir):
         pts = len(pcd.points)
         has_colors = pcd.has_colors()
         logging.info(f'[{tag}] Dense cloud: {pts} points, has_colors={has_colors}')
-        if pts < 500:
-            raise RuntimeError(f'Only {pts} points — take more overlapping photos.')
+        if pts < 5000:
+            raise RuntimeError(
+                f'Dense reconstruction only produced {pts} points — '
+                f'the photos could not be matched well enough. '
+                f'Ensure even lighting and 60%+ overlap between frames.'
+            )
 
         # ── Step 7: Clean point cloud ────────────────────────────────
         set_job(job_id, 'processing', 0.68, 'Cleaning point cloud…')
@@ -511,19 +516,18 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         mesh = _clean_mesh(mesh)
 
-        # Aggressive multi-pass hole fill — INCLUDING the very large pass.
-        # Old code skipped large fills "to preserve wrist opening" but the
-        # cylindrical UV doesn't care about openings, and skipping was the
-        # main reason for the perforated mesh. Cylindrical wrap projects the
-        # whole surface flat — any unfilled hole becomes a black hole in the
-        # texture, then dilation paints it white.
-        for _hs in (50, 200, 800, 5000, 50000):
+        # fill_holes is absent from the open3d CUDA build. Use available ops:
+        # aggressive manifold repair + vertex welding closes most small holes.
+        for _weld in (0.005, 0.002, 0.001):
             try:
-                _filled = mesh.fill_holes(hole_size=_hs)
-                mesh = _filled if hasattr(_filled, 'triangles') else _filled[0]
-            except Exception as _e:
-                logging.info(f'[{tag}] fill_holes(hole_size={_hs}) skipped: {_e}')
-
+                mesh = mesh.merge_close_vertices(_weld)
+            except Exception:
+                pass
+        mesh.remove_non_manifold_edges()
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_unreferenced_vertices()
         mesh = _clean_mesh(mesh)
 
         # Keep only largest connected component (post-fill, post-cleanup)
@@ -537,15 +541,12 @@ def run_pipeline(job_id, image_dir, job_dir):
             logging.info(f'[{tag}] Kept largest component: {len(mesh.triangles)} tris '
                          f'(of {len(tri_counts)} total)')
 
-        # One more aggressive pass to seal any holes the largest-component
-        # cut may have exposed
-        for _hs in (200, 5000, 100000):
-            try:
-                _filled = mesh.fill_holes(hole_size=_hs)
-                mesh = _filled if hasattr(_filled, 'triangles') else _filled[0]
-            except Exception:
-                pass
-
+        # Second manifold repair pass after component selection
+        mesh.remove_non_manifold_edges()
+        try:
+            mesh = mesh.merge_close_vertices(0.001)
+        except Exception:
+            pass
         mesh = _clean_mesh(mesh)
 
         # Decimate (keep more detail than before — 50K instead of 30K)
@@ -1296,7 +1297,12 @@ def write_obj(verts, faces, uvs, obj_path, mtl_path):
             f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
         f.write("\n")
         for uv in uvs:
-            f.write(f"vt {uv[0]:.6f} {uv[1]:.6f}\n")
+            # Clamp u to [0,1] — Procreate rejects u > 1.0 ("Overlapping UV").
+            # Seam-duplicated vertices have u ∈ (1.0, 1.5]; wrapping them back
+            # gives a small stretch at the single back-of-limb seam line, which
+            # is acceptable for tattoo placement. The texture bake already
+            # correctly skips/handles those triangles internally.
+            f.write(f"vt {uv[0] % 1.0:.6f} {uv[1]:.6f}\n")
         f.write("\n")
         for tri in faces:
             f.write(f"f {tri[0]+1}/{tri[0]+1} {tri[1]+1}/{tri[1]+1} {tri[2]+1}/{tri[2]+1}\n")
