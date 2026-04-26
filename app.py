@@ -435,102 +435,78 @@ def run_pipeline(job_id, image_dir, job_dir):
             raise RuntimeError('Mesh too small — try more overlapping photos.')
 
         # ── Step 9: UV unwrap ───────────────────────────────────────────
-        # Auto-detect limb vs compact shape via PCA eigenvalue ratio.
-        # Elongated (ratio > 4): cylindrical "skin-peel" UV — one continuous
-        #   rectangle, u = angle around limb, v = along limb axis.
-        #   Like Blender's Smart UV Project: peel the limb flat and print.
-        # Compact (ratio ≤ 4): xatlas island-based UV (hands, torso patches).
+        # Always use cylindrical skin-peel UV — one continuous rectangle,
+        # u = angle around the body-part axis, v = position along the axis.
+        # This matches the manual Blender workflow (Smart UV Project):
+        # peel the surface flat, print it, wrap back perfectly. Zero islands.
         set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
+        USE_CYLINDRICAL = True
 
         _cov_verts = verts - verts.mean(axis=0)
         try:
             _eigvals, _eigvecs = np.linalg.eigh(_cov_verts.T @ _cov_verts)
             _elongation = float(_eigvals[-1] / (_eigvals[-2] + 1e-10))
         except np.linalg.LinAlgError:
-            logging.warning(f'[{tag}] PCA eigendecomposition failed — defaulting to xatlas')
+            logging.warning(f'[{tag}] PCA eigendecomposition failed — using identity axes')
             _elongation = 1.0
             _eigvecs = np.eye(3, dtype=np.float32)
-        logging.info(f'[{tag}] PCA elongation ratio: {_elongation:.2f}')
-        # Threshold 2.0 catches partial limb scans too (forearm fragments etc.).
-        USE_CYLINDRICAL = _elongation > 2.0
+        logging.info(f'[{tag}] PCA elongation ratio: {_elongation:.2f} → cylindrical UV')
 
-        if USE_CYLINDRICAL:
-            logging.info(f'[{tag}] Elongated shape (ratio={_elongation:.1f}) → '
-                         f'cylindrical skin-peel UV')
-            # Principal axis = limb long axis (last eigenvector = largest eigenvalue)
-            limb_axis = _eigvecs[:, -1]
-            perp1     = _eigvecs[:, -2]
-            perp2     = np.cross(limb_axis, perp1)
-            perp2    /= np.linalg.norm(perp2) + 1e-10
+        # Principal axis = longest dimension (last eigenvector = largest eigenvalue).
+        # For a limb this is the long axis; for a compact shape it's still the
+        # best single axis to wrap around — always gives one seamless chart.
+        limb_axis = _eigvecs[:, -1]
+        perp1     = _eigvecs[:, -2]
+        perp2     = np.cross(limb_axis, perp1)
+        perp2    /= np.linalg.norm(perp2) + 1e-10
 
-            proj_along = _cov_verts @ limb_axis
-            radial     = _cov_verts - proj_along[:, None] * limb_axis
-            # u: angle around limb (0–1), v: position along limb (0–1)
-            u_uv = (np.arctan2(radial @ perp2, radial @ perp1) / (2 * np.pi) + 0.5) % 1.0
-            v_uv = (proj_along - proj_along.min()) / (proj_along.ptp() + 1e-10)
+        proj_along = _cov_verts @ limb_axis
+        radial     = _cov_verts - proj_along[:, None] * limb_axis
+        # u: angle around axis (0–1), v: position along axis (0–1)
+        u_uv = (np.arctan2(radial @ perp2, radial @ perp1) / (2 * np.pi) + 0.5) % 1.0
+        v_uv = (proj_along - proj_along.min()) / (proj_along.ptp() + 1e-10)
 
-            # ── Seam vertex duplication (Blender-style cylindrical unwrap) ──
-            # Triangles that straddle the u=0/u=1 wrap line have UVs spanning
-            # almost the entire texture width. Without fixing this, every seam
-            # triangle becomes a long stretched "island" in the OBJ — exactly
-            # the artefact visible in the user's Procreate render. Standard
-            # fix: for each crossing triangle, copy any vertex with u<0.5 and
-            # set u' = u + 1.0 on the duplicate, then rewrite that face index.
-            # The result is a single continuous chart with one clean seam edge.
-            u_per_face = u_uv[faces]
-            crosses = (u_per_face.max(axis=1) - u_per_face.min(axis=1)) > 0.5
+        # ── Seam vertex duplication (Blender-style cylindrical unwrap) ──
+        # Triangles that straddle the u=0/u=1 wrap line have UVs spanning
+        # almost the entire texture width. Without fixing this, every seam
+        # triangle becomes a long stretched "island" in the OBJ — exactly
+        # the artefact visible in the user's Procreate render. Standard
+        # fix: for each crossing triangle, copy any vertex with u<0.5 and
+        # set u' = u + 1.0 on the duplicate, then rewrite that face index.
+        # The result is a single continuous chart with one clean seam edge.
+        u_per_face = u_uv[faces]
+        crosses = (u_per_face.max(axis=1) - u_per_face.min(axis=1)) > 0.5
 
-            verts_list = list(verts)
-            u_list     = list(u_uv)
-            v_list     = list(v_uv)
-            faces_arr  = faces.astype(np.int64).copy()
-            shifted_v  = {}
-            for fi in np.where(crosses)[0]:
-                tri = faces[fi]
-                for i in range(3):
-                    v_idx = int(tri[i])
-                    if u_uv[v_idx] < 0.5:
-                        nidx = shifted_v.get(v_idx)
-                        if nidx is None:
-                            nidx = len(verts_list)
-                            verts_list.append(verts[v_idx])
-                            u_list.append(float(u_uv[v_idx]) + 1.0)
-                            v_list.append(float(v_uv[v_idx]))
-                            shifted_v[v_idx] = nidx
-                        faces_arr[fi, i] = nidx
+        verts_list = list(verts)
+        u_list     = list(u_uv)
+        v_list     = list(v_uv)
+        faces_arr  = faces.astype(np.int64).copy()
+        shifted_v  = {}
+        for fi in np.where(crosses)[0]:
+            tri = faces[fi]
+            for i in range(3):
+                v_idx = int(tri[i])
+                if u_uv[v_idx] < 0.5:
+                    nidx = shifted_v.get(v_idx)
+                    if nidx is None:
+                        nidx = len(verts_list)
+                        verts_list.append(verts[v_idx])
+                        u_list.append(float(u_uv[v_idx]) + 1.0)
+                        v_list.append(float(v_uv[v_idx]))
+                        shifted_v[v_idx] = nidx
+                    faces_arr[fi, i] = nidx
 
-            new_verts = np.asarray(verts_list, dtype=np.float32)
-            new_faces = faces_arr.astype(np.uint32)
-            uvs = np.stack(
-                [np.asarray(u_list, dtype=np.float32),
-                 np.asarray(v_list, dtype=np.float32)],
-                axis=1
-            )
-            logging.info(f'[{tag}] Cylindrical UV: u=[{uvs[:,0].min():.3f},'
-                         f'{uvs[:,0].max():.3f}] v=[{uvs[:,1].min():.3f},'
-                         f'{uvs[:,1].max():.3f}], duplicated {len(shifted_v)} '
-                         f'seam verts across {int(crosses.sum())} crossing tris')
-        else:
-            logging.info(f'[{tag}] Compact shape (ratio={_elongation:.1f}) → xatlas UV')
-            try:
-                _atlas = xatlas.Atlas()
-                _atlas.add_mesh(verts, faces)
-                _co = xatlas.ChartOptions()
-                _co.max_cost = 8.0
-                _co.normal_deviation_weight = 0.5
-                _po = xatlas.PackOptions()
-                _po.resolution = 2048
-                _po.padding = 2
-                _atlas.generate(chart_options=_co, pack_options=_po)
-                vmapping, new_faces, uvs = _atlas[0]
-            except Exception as _xe:
-                logging.warning(f'[{tag}] xatlas Atlas API unavailable ({_xe}), '
-                                f'using parametrize')
-                vmapping, new_faces, uvs = xatlas.parametrize(verts, faces)
-            new_verts = verts[vmapping]
-            logging.info(f'[{tag}] xatlas: {len(new_verts)} verts, {len(new_faces)} tris, '
-                         f'UV range u=[{uvs[:,0].min():.3f},{uvs[:,0].max():.3f}] '
-                         f'v=[{uvs[:,1].min():.3f},{uvs[:,1].max():.3f}]')
+        new_verts = np.asarray(verts_list, dtype=np.float32)
+        new_faces = faces_arr.astype(np.uint32)
+        uvs = np.stack(
+            [np.asarray(u_list, dtype=np.float32),
+             np.asarray(v_list, dtype=np.float32)],
+            axis=1
+        )
+        logging.info(f'[{tag}] Cylindrical UV: u=[{uvs[:,0].min():.3f},'
+                     f'{uvs[:,0].max():.3f}] v=[{uvs[:,1].min():.3f},'
+                     f'{uvs[:,1].max():.3f}], duplicated {len(shifted_v)} '
+                     f'seam verts across {int(crosses.sum())} crossing tris')
 
         # ── Step 10: Bake texture from photos using COLMAP camera poses ──
         # This projects the original photos onto the UV map — same as Blender's
