@@ -91,18 +91,36 @@ def enqueue_job(job_id, img_dir, job_dir):
             queue.append((job_id, img_dir, job_dir))
             set_job(job_id, 'queued', 0.0, f'In queue (position {len(queue)})')
 
+def _pipeline_in_new_session(job_id, img_dir, job_dir):
+    """Child-process entry point. Called after fork — runs in its own session
+    so it is completely immune to gunicorn's SIGHUP/SIGTERM signal broadcasts."""
+    # Detach from gunicorn's process group and terminal session.
+    # After setsid(), no signal sent to gunicorn's process group can reach us.
+    os.setsid()
+    # Re-initialise logging in the child (inherited handlers may be in a locked
+    # state at fork time, which causes silent deadlock on the first log call).
+    for h in logging.root.handlers[:]:
+        logging.root.removeHandler(h)
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)s %(message)s',
+                        stream=open('/workspace/server.log', 'a'))
+    run_pipeline(job_id, img_dir, job_dir)
+
+
 def _run_and_release(job_id, img_dir, job_dir):
     global active_count
     try:
-        # Run the pipeline in a SEPARATE PROCESS (daemon=False) so it
-        # outlives gunicorn worker restarts (SIGHUP/SIGTERM). The subprocess
-        # writes status to disk via set_job(); gunicorn workers read it back
-        # via get_job(). This thread just waits for the subprocess to finish.
         p = multiprocessing.Process(
-            target=run_pipeline, args=(job_id, img_dir, job_dir), daemon=False)
+            target=_pipeline_in_new_session,
+            args=(job_id, img_dir, job_dir),
+            daemon=False)
         p.start()
-        logging.info(f'[{job_id[:8]}] Pipeline subprocess PID={p.pid}')
-        p.join()  # block this thread until pipeline subprocess exits
+        logging.info(f'[{job_id[:8]}] Pipeline subprocess PID={p.pid} (session-isolated)')
+        # Poll every 30 s so this thread can be interrupted cleanly.
+        # If this thread dies (worker restart), p keeps running in its own
+        # session and writes status to disk; new worker reads it via get_job().
+        while p.is_alive():
+            p.join(timeout=30)
         logging.info(f'[{job_id[:8]}] Pipeline subprocess finished (exit={p.exitcode})')
     finally:
         with lock:
