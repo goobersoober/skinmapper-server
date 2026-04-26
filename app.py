@@ -81,44 +81,38 @@ def get_job(job_id):
         return jobs.get(job_id)
 
 # ── Job queue ────────────────────────────────────────────────────────
-def enqueue_job(job_id, img_dir, job_dir):
+def enqueue_job(job_id, img_dir, job_dir, scan_type='halfWrap', body_part='leg'):
     global active_count
     with lock:
         if active_count < MAX_CONCURRENT:
             active_count += 1
-            threading.Thread(target=_run_and_release, args=(job_id, img_dir, job_dir), daemon=True).start()
+            threading.Thread(target=_run_and_release,
+                             args=(job_id, img_dir, job_dir, scan_type, body_part),
+                             daemon=True).start()
         else:
-            queue.append((job_id, img_dir, job_dir))
+            queue.append((job_id, img_dir, job_dir, scan_type, body_part))
             set_job(job_id, 'queued', 0.0, f'In queue (position {len(queue)})')
 
-def _pipeline_in_new_session(job_id, img_dir, job_dir):
-    """Child-process entry point. Called after fork — runs in its own session
-    so it is completely immune to gunicorn's SIGHUP/SIGTERM signal broadcasts."""
-    # Detach from gunicorn's process group and terminal session.
-    # After setsid(), no signal sent to gunicorn's process group can reach us.
+def _pipeline_in_new_session(job_id, img_dir, job_dir, scan_type, body_part):
+    """Child-process entry point — runs in its own session, immune to gunicorn SIGHUP."""
     os.setsid()
-    # Re-initialise logging in the child (inherited handlers may be in a locked
-    # state at fork time, which causes silent deadlock on the first log call).
     for h in logging.root.handlers[:]:
         logging.root.removeHandler(h)
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s',
                         stream=open('/workspace/server.log', 'a'))
-    run_pipeline(job_id, img_dir, job_dir)
+    run_pipeline(job_id, img_dir, job_dir, scan_type=scan_type, body_part=body_part)
 
 
-def _run_and_release(job_id, img_dir, job_dir):
+def _run_and_release(job_id, img_dir, job_dir, scan_type='halfWrap', body_part='leg'):
     global active_count
     try:
         p = multiprocessing.Process(
             target=_pipeline_in_new_session,
-            args=(job_id, img_dir, job_dir),
+            args=(job_id, img_dir, job_dir, scan_type, body_part),
             daemon=False)
         p.start()
         logging.info(f'[{job_id[:8]}] Pipeline subprocess PID={p.pid} (session-isolated)')
-        # Poll every 30 s so this thread can be interrupted cleanly.
-        # If this thread dies (worker restart), p keeps running in its own
-        # session and writes status to disk; new worker reads it via get_job().
         while p.is_alive():
             p.join(timeout=30)
         logging.info(f'[{job_id[:8]}] Pipeline subprocess finished (exit={p.exitcode})')
@@ -132,8 +126,10 @@ def _start_next():
     with lock:
         if queue and active_count < MAX_CONCURRENT:
             active_count += 1
-            job_id, img_dir, job_dir = queue.popleft()
-            threading.Thread(target=_run_and_release, args=(job_id, img_dir, job_dir), daemon=True).start()
+            job_id, img_dir, job_dir, scan_type, body_part = queue.popleft()
+            threading.Thread(target=_run_and_release,
+                             args=(job_id, img_dir, job_dir, scan_type, body_part),
+                             daemon=True).start()
 
 def cleanup_old_jobs():
     now = time.time()
@@ -146,7 +142,7 @@ def cleanup_old_jobs():
 
 # ── Pipeline ─────────────────────────────────────────────────────────
 
-def run_pipeline(job_id, image_dir, job_dir):
+def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='leg'):
     tag = job_id[:8]
     use_gpu = '1' if HAS_GPU else '0'
 
@@ -454,11 +450,14 @@ def run_pipeline(job_id, image_dir, job_dir):
         # Per-VERTEX distance is smoother than per-face → fewer holes
         v_dists, _ = cKDTree(pcd_points).query(v_arr)
 
-        # Use 96th percentile as cutoff — keeps everything within ~1.5×median
-        # scan-to-mesh distance. Far more conservative than IQR×3.
-        cutoff = float(np.percentile(v_dists, 96))
-        # Floor it at 2cm so we never trim aggressively on very-clean scans
-        cutoff = max(cutoff, 0.02)
+        # Use 85th percentile — removes the Poisson-hallucinated back-of-limb
+        # surface (unscanned side has vertices far from any real scan point).
+        # 96th was too loose: back surface survived and produced geometric blobs
+        # in the texture. 85th cuts more but vertex-erosion below prevents holes
+        # in the actual scanned surface.
+        cutoff = float(np.percentile(v_dists, 85))
+        # Floor it at 1cm so we never trim aggressively on very-clean scans
+        cutoff = max(cutoff, 0.01)
         bad_v = v_dists > cutoff
 
         # Vertex-mask EROSION before trim: only kill a vertex if BOTH it AND
@@ -585,7 +584,6 @@ def run_pipeline(job_id, image_dir, job_dir):
         # This matches the manual Blender workflow (Smart UV Project):
         # peel the surface flat, print it, wrap back perfectly. Zero islands.
         set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
-        USE_CYLINDRICAL = True
 
         _cov_verts = verts - verts.mean(axis=0)
         try:
@@ -607,39 +605,66 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         proj_along = _cov_verts @ limb_axis
         radial     = _cov_verts - proj_along[:, None] * limb_axis
-        # u: angle around axis (0–1), v: position along axis (0–1)
-        u_uv = (np.arctan2(radial @ perp2, radial @ perp1) / (2 * np.pi) + 0.5) % 1.0
-        v_uv = (proj_along - proj_along.min()) / (proj_along.max() - proj_along.min() + 1e-10)
 
-        # ── Seam vertex duplication (Blender-style cylindrical unwrap) ──
-        # Triangles that straddle the u=0/u=1 wrap line have UVs spanning
-        # almost the entire texture width. Without fixing this, every seam
-        # triangle becomes a long stretched "island" in the OBJ — exactly
-        # the artefact visible in the user's Procreate render. Standard
-        # fix: for each crossing triangle, copy any vertex with u<0.5 and
-        # set u' = u + 1.0 on the duplicate, then rewrite that face index.
-        # The result is a single continuous chart with one clean seam edge.
-        u_per_face = u_uv[faces]
-        crosses = (u_per_face.max(axis=1) - u_per_face.min(axis=1)) > 0.5
+        # ── UV mode from scan_type sent by iOS app ─────────────────────
+        # fullWrap  = full 360° around limb → cylindrical UV
+        # halfWrap  = front-only / partial  → planar UV (no seam)
+        # cap       = shoulder/end cap      → planar UV
+        # patch     = small area            → planar UV
+        # backPanel = flat back area        → planar UV
+        IS_PARTIAL_SCAN = scan_type != 'fullWrap'
+        logging.info(f'[{tag}] scan_type={scan_type} body_part={body_part} → '
+                     f'{"PLANAR" if IS_PARTIAL_SCAN else "CYLINDRICAL"} UV')
 
+        if IS_PARTIAL_SCAN:
+            # ── Planar UV (correct for front-only / half scans) ─────────
+            # Project vertices onto the scan plane:
+            #   u = position left-right across the leg (perp2 axis)
+            #   v = position up-down the leg (limb axis)
+            # No seam, no wrapping, no islands. One flat rectangle of skin.
+            u_raw = radial @ perp2   # left-right
+            v_raw = proj_along       # up-down
+            u_uv  = (u_raw - u_raw.min()) / (u_raw.max() - u_raw.min() + 1e-10)
+            v_uv  = (v_raw - v_raw.min()) / (v_raw.max() - v_raw.min() + 1e-10)
+        else:
+            # ── Cylindrical UV (correct for full 360° wrap scans) ───────
+            raw_angle = np.arctan2(radial @ perp2, radial @ perp1)
+            # Put seam at least-photographed angle
+            _pcd_centered = pcd_points - centroid
+            _pcd_proj = _pcd_centered @ limb_axis
+            _pcd_radial = _pcd_centered - _pcd_proj[:, None] * limb_axis
+            _pcd_angles = np.arctan2(_pcd_radial @ perp2, _pcd_radial @ perp1)
+            _hist, _bins = np.histogram(_pcd_angles, bins=36, range=(-np.pi, np.pi))
+            _seam_bin    = int(np.argmin(_hist))
+            _seam_angle  = float((_bins[_seam_bin] + _bins[_seam_bin + 1]) / 2)
+            logging.info(f'[{tag}] Cylindrical seam at {np.degrees(_seam_angle):.1f}°')
+            u_uv = ((raw_angle - _seam_angle) / (2 * np.pi) + 0.5) % 1.0
+            v_uv = (proj_along - proj_along.min()) / (proj_along.max() - proj_along.min() + 1e-10)
+
+        # ── Seam vertex duplication (cylindrical wrap only) ────────────
+        # Only needed for full-wrap cylindrical UV. Planar UV has no seam.
         verts_list = list(verts)
         u_list     = list(u_uv)
         v_list     = list(v_uv)
         faces_arr  = faces.astype(np.int64).copy()
-        shifted_v  = {}
-        for fi in np.where(crosses)[0]:
-            tri = faces[fi]
-            for i in range(3):
-                v_idx = int(tri[i])
-                if u_uv[v_idx] < 0.5:
-                    nidx = shifted_v.get(v_idx)
-                    if nidx is None:
-                        nidx = len(verts_list)
-                        verts_list.append(verts[v_idx])
-                        u_list.append(float(u_uv[v_idx]) + 1.0)
-                        v_list.append(float(v_uv[v_idx]))
-                        shifted_v[v_idx] = nidx
-                    faces_arr[fi, i] = nidx
+
+        if not IS_PARTIAL_SCAN:
+            u_per_face = u_uv[faces]
+            crosses = (u_per_face.max(axis=1) - u_per_face.min(axis=1)) > 0.5
+            shifted_v = {}
+            for fi in np.where(crosses)[0]:
+                tri = faces[fi]
+                for i in range(3):
+                    v_idx = int(tri[i])
+                    if u_uv[v_idx] < 0.5:
+                        nidx = shifted_v.get(v_idx)
+                        if nidx is None:
+                            nidx = len(verts_list)
+                            verts_list.append(verts[v_idx])
+                            u_list.append(float(u_uv[v_idx]) + 1.0)
+                            v_list.append(float(v_uv[v_idx]))
+                            shifted_v[v_idx] = nidx
+                        faces_arr[fi, i] = nidx
 
         new_verts = np.asarray(verts_list, dtype=np.float32)
         new_faces = faces_arr.astype(np.uint32)
@@ -648,10 +673,15 @@ def run_pipeline(job_id, image_dir, job_dir):
              np.asarray(v_list, dtype=np.float32)],
             axis=1
         )
-        logging.info(f'[{tag}] Cylindrical UV: u=[{uvs[:,0].min():.3f},'
-                     f'{uvs[:,0].max():.3f}] v=[{uvs[:,1].min():.3f},'
-                     f'{uvs[:,1].max():.3f}], duplicated {len(shifted_v)} '
-                     f'seam verts across {int(crosses.sum())} crossing tris')
+        if IS_PARTIAL_SCAN:
+            logging.info(f'[{tag}] Planar UV: u=[{uvs[:,0].min():.3f},'
+                         f'{uvs[:,0].max():.3f}] v=[{uvs[:,1].min():.3f},'
+                         f'{uvs[:,1].max():.3f}] (no seam)')
+        else:
+            logging.info(f'[{tag}] Cylindrical UV: u=[{uvs[:,0].min():.3f},'
+                         f'{uvs[:,0].max():.3f}] v=[{uvs[:,1].min():.3f},'
+                         f'{uvs[:,1].max():.3f}], duplicated {len(shifted_v)} '
+                         f'seam verts across {int(crosses.sum())} crossing tris')
 
         # ── Step 10: Bake texture from photos using COLMAP camera poses ──
         # This projects the original photos onto the UV map — same as Blender's
@@ -665,7 +695,7 @@ def run_pipeline(job_id, image_dir, job_dir):
             new_verts, new_faces, uvs,
             undistorted_images, dense_sparse,
             TEX_SIZE, tag,
-            use_cylindrical=USE_CYLINDRICAL
+            use_cylindrical=not IS_PARTIAL_SCAN
         )
 
         # Fallback: if photo bake failed, use vertex colors from point cloud
@@ -712,7 +742,7 @@ def run_pipeline(job_id, image_dir, job_dir):
         # ── Pipeline quality validation ─────────────────────────────────
         tri_cl, tri_ct, _ = mesh.cluster_connected_triangles()
         n_components = len(np.asarray(tri_ct))
-        uv_label = 'cylindrical (1 island)' if USE_CYLINDRICAL else 'xatlas'
+        uv_label = 'planar (1 island)' if IS_PARTIAL_SCAN else 'cylindrical (1 island)'
         logging.info(f'[{tag}] ── Pipeline quality summary ─────────────')
         logging.info(f'[{tag}]   Mesh components : {n_components} (want 1)')
         logging.info(f'[{tag}]   UV method       : {uv_label}')
@@ -1376,8 +1406,18 @@ def submit():
             shutil.rmtree(job_dir, ignore_errors=True)
             return jsonify(error=f'{count} photos — max is {MAX_PHOTOS}.'), 400
 
+        # Read scan metadata sent by iOS app
+        scan_type = request.form.get('scan_type', 'halfWrap')   # fullWrap|halfWrap|cap|patch|backPanel
+        body_part = request.form.get('body_part', 'leg')
+        logging.info(f'[{job_id[:8]}] scan_type={scan_type} body_part={body_part}')
+
+        # Persist metadata alongside the job so retry can reuse it
+        meta = dict(scan_type=scan_type, body_part=body_part)
+        with open(os.path.join(job_dir, 'meta.json'), 'w') as _mf:
+            json.dump(meta, _mf)
+
         set_job(job_id, 'queued', 0.0, f'Queued — {count} photos')
-        enqueue_job(job_id, img_dir, job_dir)
+        enqueue_job(job_id, img_dir, job_dir, scan_type=scan_type, body_part=body_part)
         return jsonify(job_id=job_id, image_count=count), 202
 
     except Exception as e:
@@ -1444,9 +1484,26 @@ def retry_job(job_id):
             shutil.rmtree(new_job_dir, ignore_errors=True)
             return jsonify(error=f'Only {count} photos in original job — need at least 10'), 400
 
-        logging.info(f'[{new_job_id[:8]}] Retry of {job_id[:8]}: {count} photos')
+        # Load scan metadata from the original job so retry uses the same settings
+        old_meta_path = os.path.join(JOBS_DIR, job_id, 'meta.json')
+        try:
+            with open(old_meta_path) as _mf:
+                old_meta = json.load(_mf)
+            scan_type = old_meta.get('scan_type', 'halfWrap')
+            body_part = old_meta.get('body_part', 'leg')
+        except Exception:
+            scan_type = 'halfWrap'
+            body_part = 'leg'
+
+        # Copy meta to new job dir
+        meta = dict(scan_type=scan_type, body_part=body_part)
+        with open(os.path.join(new_job_dir, 'meta.json'), 'w') as _mf:
+            json.dump(meta, _mf)
+
+        logging.info(f'[{new_job_id[:8]}] Retry of {job_id[:8]}: {count} photos, '
+                     f'scan_type={scan_type} body_part={body_part}')
         set_job(new_job_id, 'queued', 0.0, f'Queued — {count} photos (retry)')
-        enqueue_job(new_job_id, new_img_dir, new_job_dir)
+        enqueue_job(new_job_id, new_img_dir, new_job_dir, scan_type=scan_type, body_part=body_part)
         return jsonify(job_id=new_job_id, image_count=count), 202
 
     except Exception as e:
