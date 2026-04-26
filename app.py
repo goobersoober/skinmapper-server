@@ -306,6 +306,19 @@ def run_pipeline(job_id, image_dir, job_dir):
         # Quadraflow remesh in the manual workflow.
         set_job(job_id, 'processing', 0.71, 'Estimating normals…')
 
+        # Downsample to at most 60K points before Poisson.
+        # Open3D Poisson is single-threaded; 120K+ points can take >10 min
+        # and hit the gunicorn timeout. 60K is plenty of density for a limb
+        # scan at Poisson depth=9 (voxel grid keeps point distribution even).
+        MAX_POISSON_PTS = 60_000
+        n_pts = len(pcd.points)
+        if n_pts > MAX_POISSON_PTS:
+            vox = (np.asarray(pcd.points).ptp(axis=0).max() /
+                   (MAX_POISSON_PTS ** (1/3)))
+            pcd = pcd.voxel_down_sample(voxel_size=float(vox))
+            logging.info(f'[{tag}] Downsampled {n_pts} → {len(pcd.points)} pts '
+                         f'(voxel={vox:.5f}m) for Poisson')
+
         # Estimate and orient normals (critical for Poisson quality)
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30))
         # Orient normals using the centroid as a reference (away from inside)
