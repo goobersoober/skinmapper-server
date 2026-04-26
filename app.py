@@ -3,7 +3,7 @@ SkinMapper Server — GPU-accelerated photogrammetry pipeline
 COLMAP (dense reconstruction) + open3d (meshing) + texture baking from photos
 """
 
-import os, uuid, zipfile, subprocess, threading, json, shutil, logging, traceback, time, struct
+import os, uuid, zipfile, subprocess, threading, json, shutil, logging, traceback, time, struct, multiprocessing
 from collections import deque
 
 # COLMAP requires a display on headless servers — force offscreen Qt
@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
 
-JOBS_DIR = '/tmp/skinmapper_jobs'
+JOBS_DIR = '/workspace/jobs'  # persistent volume — survives gunicorn worker restarts
 MAX_CONCURRENT = 2
 MAX_QUEUE = 10
 MAX_PHOTOS = 60
@@ -47,11 +47,36 @@ queue = deque()
 active_count = 0
 
 def set_job(job_id, status, progress, message, result_url=None, error=None):
+    data = dict(status=status, progress=progress, message=message,
+                result_url=result_url, error=error, updated=time.time())
     with lock:
-        jobs[job_id] = dict(status=status, progress=progress, message=message,
-                            result_url=result_url, error=error, updated=time.time())
+        jobs[job_id] = data
+    # Write to disk so new gunicorn workers can read status after a reload.
+    # The pipeline runs in a subprocess; gunicorn workers read this file.
+    try:
+        job_dir = os.path.join(JOBS_DIR, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        tmp = os.path.join(job_dir, 'status.json.tmp')
+        dst = os.path.join(job_dir, 'status.json')
+        with open(tmp, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp, dst)  # atomic
+    except Exception as _e:
+        logging.warning(f'set_job disk write failed for {job_id}: {_e}')
 
 def get_job(job_id):
+    # Always prefer disk — the pipeline is a subprocess and writes status
+    # to disk; the in-memory dict in the gunicorn worker is always stale.
+    try:
+        path = os.path.join(JOBS_DIR, job_id, 'status.json')
+        if os.path.exists(path):
+            with open(path) as f:
+                j = json.load(f)
+            with lock:
+                jobs[job_id] = j
+            return j
+    except Exception:
+        pass
     with lock:
         return jobs.get(job_id)
 
@@ -69,7 +94,16 @@ def enqueue_job(job_id, img_dir, job_dir):
 def _run_and_release(job_id, img_dir, job_dir):
     global active_count
     try:
-        run_pipeline(job_id, img_dir, job_dir)
+        # Run the pipeline in a SEPARATE PROCESS (daemon=False) so it
+        # outlives gunicorn worker restarts (SIGHUP/SIGTERM). The subprocess
+        # writes status to disk via set_job(); gunicorn workers read it back
+        # via get_job(). This thread just waits for the subprocess to finish.
+        p = multiprocessing.Process(
+            target=run_pipeline, args=(job_id, img_dir, job_dir), daemon=False)
+        p.start()
+        logging.info(f'[{job_id[:8]}] Pipeline subprocess PID={p.pid}')
+        p.join()  # block this thread until pipeline subprocess exits
+        logging.info(f'[{job_id[:8]}] Pipeline subprocess finished (exit={p.exitcode})')
     finally:
         with lock:
             active_count -= 1
