@@ -1254,6 +1254,56 @@ def result(job_id):
                      as_attachment=True, download_name='scan.zip')
 
 
+@app.route('/retry/<job_id>', methods=['POST'])
+def retry_job(job_id):
+    """
+    Re-run the pipeline using the photos.zip saved from a previous job.
+    The original photos.zip is kept after cleanup so the user can retry
+    without re-uploading photos from the device.
+    Returns the same shape as /submit: {job_id, image_count}.
+    """
+    try:
+        old_zip = os.path.join(JOBS_DIR, job_id, 'photos.zip')
+        if not os.path.exists(old_zip):
+            return jsonify(error='Original photos not found — job may have expired'), 404
+
+        new_job_id = str(uuid.uuid4())
+        new_job_dir = os.path.join(JOBS_DIR, new_job_id)
+        new_img_dir = os.path.join(new_job_dir, 'images')
+        os.makedirs(new_img_dir, exist_ok=True)
+
+        # Copy zip to new job dir (keeps the original intact for further retries)
+        new_zip = os.path.join(new_job_dir, 'photos.zip')
+        shutil.copy2(old_zip, new_zip)
+
+        # Extract images
+        IMG_EXTS = {'.jpg', '.jpeg', '.png', '.heic', '.heif'}
+        with zipfile.ZipFile(new_zip, 'r') as zf:
+            for member in zf.namelist():
+                fname = os.path.basename(member)
+                if not fname:
+                    continue
+                if os.path.splitext(fname.lower())[1] not in IMG_EXTS:
+                    continue
+                with zf.open(member) as src, \
+                     open(os.path.join(new_img_dir, fname), 'wb') as dst:
+                    dst.write(src.read())
+
+        count = len(os.listdir(new_img_dir))
+        if count < 10:
+            shutil.rmtree(new_job_dir, ignore_errors=True)
+            return jsonify(error=f'Only {count} photos in original job — need at least 10'), 400
+
+        logging.info(f'[{new_job_id[:8]}] Retry of {job_id[:8]}: {count} photos')
+        set_job(new_job_id, 'queued', 0.0, f'Queued — {count} photos (retry)')
+        enqueue_job(new_job_id, new_img_dir, new_job_dir)
+        return jsonify(job_id=new_job_id, image_count=count), 202
+
+    except Exception as e:
+        logging.exception(f'[retry] {e}')
+        return jsonify(error=str(e)), 500
+
+
 @app.route('/logs')
 def logs():
     """View recent server logs for debugging."""
