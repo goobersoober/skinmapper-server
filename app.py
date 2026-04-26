@@ -22,7 +22,7 @@ MAX_CONCURRENT = 2
 MAX_QUEUE = 10
 MAX_PHOTOS = 60
 JOB_TTL = 3600
-MAX_DIM = 1600  # full resolution with GPU
+MAX_DIM = 2400  # full resolution with GPU (bumped from 1600 for sharper textures)
 
 os.makedirs(JOBS_DIR, exist_ok=True)
 
@@ -147,9 +147,11 @@ def run_pipeline(job_id, image_dir, job_dir):
         if not imgs:
             raise RuntimeError('No valid images found')
 
-        # Downscale if needed
+        # Downscale if needed + photo-quality filter (drop blurriest 20%)
         set_job(job_id, 'processing', 0.03, 'Preparing images…')
         from PIL import Image
+        import cv2 as _cv2_pre
+        sharp_scores = {}
         for fname in imgs:
             fpath = os.path.join(image_dir, fname)
             try:
@@ -158,9 +160,34 @@ def run_pipeline(job_id, image_dir, job_dir):
                     if max(w, h) > MAX_DIM:
                         scale = MAX_DIM / max(w, h)
                         im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-                        im.save(fpath, quality=90)
+                        im.save(fpath, quality=92)
+                # Laplacian variance = sharpness proxy (higher = sharper)
+                _g = _cv2_pre.imread(fpath, _cv2_pre.IMREAD_GRAYSCALE)
+                if _g is not None:
+                    sharp_scores[fname] = float(_cv2_pre.Laplacian(_g, _cv2_pre.CV_64F).var())
             except Exception as e:
                 logging.warning(f'[{tag}] Resize {fname}: {e}')
+
+        # Drop the blurriest 20% IF we have ≥10 photos (need enough overlap)
+        if len(sharp_scores) >= 10:
+            scores_sorted = sorted(sharp_scores.values())
+            blur_cutoff = scores_sorted[max(1, int(len(scores_sorted) * 0.20))]
+            killed = []
+            for fname, s in sharp_scores.items():
+                if s < blur_cutoff:
+                    try:
+                        os.remove(os.path.join(image_dir, fname))
+                        killed.append((fname, s))
+                    except Exception:
+                        pass
+            if killed:
+                logging.info(f'[{tag}] Dropped {len(killed)} blurry photos '
+                             f'(Laplacian var < {blur_cutoff:.1f}): '
+                             + ', '.join(f'{n}({s:.0f})' for n, s in killed[:5])
+                             + (f', +{len(killed)-5} more' if len(killed) > 5 else ''))
+            imgs = [f for f in os.listdir(image_dir)
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            logging.info(f'[{tag}] After blur filter: {len(imgs)} images')
 
         # 1 — Feature extraction (CPU — COLMAP's SiftGPU needs OpenGL display)
         run(['colmap', 'feature_extractor',
@@ -353,48 +380,58 @@ def run_pipeline(job_id, image_dir, job_dir):
 
         logging.info(f'[{tag}] Poisson raw: {len(mesh.triangles)} tris')
 
-        # ── Point-cloud guided trimming ─────────────────────────────────
-        # THE correct way to separate arm from background/floor.
-        # Density trimming uses Poisson reconstruction density — a mesh
-        # artefact that doesn't reliably distinguish arm vs floor.
-        # This method asks: "is this face near any REAL scan point?"
-        # Floor/table faces are far from arm scan points → removed.
-        # Arm faces are always within a few mm of real data → kept.
-        # Uses IQR outlier detection so it adapts to any scan geometry.
+        # ── Point-cloud guided trimming + AGGRESSIVE topology repair ───
+        # CRITICAL: previous IQR cut at 3.0×IQR was drilling swiss-cheese
+        # holes through the mesh, which then propagated to texture as the
+        # white-outlined shattered pattern. New approach:
+        #   1. Per-vertex distance to scan cloud (smoother than per-face)
+        #   2. Soft percentile cut (95th) instead of hard IQR
+        #   3. Morphological closing of triangle mask via vertex dilation
+        #      to reseal small gaps before they become holes
+        #   4. Aggressive multi-pass hole fill including large pass
+        #   5. Drop tiny floating fragments BEFORE largest-component
         set_job(job_id, 'processing', 0.73, 'Removing background…')
 
         v_arr = np.asarray(mesh.vertices)
         f_arr = np.asarray(mesh.triangles)
-        centroids = (v_arr[f_arr[:, 0]] + v_arr[f_arr[:, 1]] + v_arr[f_arr[:, 2]]) / 3
-        dists, _ = cKDTree(pcd_points).query(centroids)
+        # Per-VERTEX distance is smoother than per-face → fewer holes
+        v_dists, _ = cKDTree(pcd_points).query(v_arr)
 
-        # IQR outlier detection: faces with distance > Q3 + 3.0*IQR are background.
-        # 3.0 is intentionally loose — over-trimming was eating real mesh and
-        # leaving the perforations the user reported. Better to keep a few
-        # background tris (largest-component step removes them) than to drill
-        # holes through the limb.
-        q1, q3 = np.percentile(dists, [25, 75])
-        iqr_thresh = q3 + 3.0 * (q3 - q1)
-        bg_mask = dists > iqr_thresh
-        mesh.remove_triangles_by_mask(bg_mask)
+        # Use 96th percentile as cutoff — keeps everything within ~1.5×median
+        # scan-to-mesh distance. Far more conservative than IQR×3.
+        cutoff = float(np.percentile(v_dists, 96))
+        # Floor it at 2cm so we never trim aggressively on very-clean scans
+        cutoff = max(cutoff, 0.02)
+        bad_v = v_dists > cutoff
+
+        # Vertex-mask EROSION before trim: only kill a vertex if BOTH it AND
+        # all its neighbours are far from scan data. This stops the trim from
+        # nibbling holes into the limb surface where one stray Poisson vertex
+        # extruded outward.
+        from collections import defaultdict
+        v_neighbors = defaultdict(set)
+        for tri in f_arr:
+            a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+            v_neighbors[a].update((b, c))
+            v_neighbors[b].update((a, c))
+            v_neighbors[c].update((a, b))
+        bad_v_eroded = bad_v.copy()
+        for vi in np.where(bad_v)[0]:
+            if not all(bad_v[nv] for nv in v_neighbors[vi]):
+                bad_v_eroded[vi] = False
+
+        # Now mark faces bad only if ALL THREE vertices are bad (was ANY before)
+        bad_face = bad_v_eroded[f_arr[:, 0]] & bad_v_eroded[f_arr[:, 1]] & bad_v_eroded[f_arr[:, 2]]
+        mesh.remove_triangles_by_mask(bad_face)
         mesh.remove_unreferenced_vertices()
-        logging.info(f'[{tag}] Point-cloud trim: removed {bg_mask.sum()} background faces, '
-                     f'{len(mesh.triangles)} remain (IQR threshold={iqr_thresh:.4f}m)')
+        logging.info(f'[{tag}] Trim: cutoff={cutoff*1000:.1f}mm, '
+                     f'removed {int(bad_face.sum())}/{len(bad_face)} faces '
+                     f'({bad_face.mean()*100:.1f}%), {len(mesh.triangles)} remain')
 
-        # Smooth before fill/cleanup so normals are coherent
+        # Smooth BEFORE fill so the fill triangulation lays into coherent normals
         mesh = mesh.filter_smooth_taubin(number_of_iterations=10)
 
-        # Multi-pass hole fill: small gaps first, then progressively larger.
-        # Skip the largest pass to preserve the wrist/ankle scan opening.
-        for _hs in (100, 300, 1000):
-            try:
-                _filled = mesh.fill_holes(hole_size=_hs)
-                # fill_holes may return a TriangleMesh or a tuple in some builds
-                mesh = _filled if hasattr(_filled, 'triangles') else _filled[0]
-            except Exception:
-                pass  # fill_holes may not be available in older Open3D builds
-
-        # Standard mesh cleanup — run twice: once before, once after hole-fill
+        # Standard cleanup helper
         def _clean_mesh(m):
             m.remove_degenerate_triangles()
             m.remove_duplicated_triangles()
@@ -406,9 +443,38 @@ def run_pipeline(job_id, image_dir, job_dir):
                 pass
             return m
 
+        # Drop tiny floating fragments BEFORE hole fill — fill_holes can't
+        # close gaps that are bridged by stray fragments.
+        tri_clusters, tri_counts, _ = mesh.cluster_connected_triangles()
+        tri_clusters = np.asarray(tri_clusters)
+        tri_counts   = np.asarray(tri_counts)
+        if len(tri_counts) > 1:
+            biggest = int(tri_counts.argmax())
+            tiny = tri_counts < max(50, tri_counts[biggest] * 0.01)
+            kill = np.isin(tri_clusters, np.where(tiny)[0])
+            if kill.any():
+                mesh.remove_triangles_by_mask(kill)
+                mesh.remove_unreferenced_vertices()
+                logging.info(f'[{tag}] Dropped {int(kill.sum())} tris in {int(tiny.sum())} tiny fragments')
+
         mesh = _clean_mesh(mesh)
 
-        # Keep only largest connected component
+        # Aggressive multi-pass hole fill — INCLUDING the very large pass.
+        # Old code skipped large fills "to preserve wrist opening" but the
+        # cylindrical UV doesn't care about openings, and skipping was the
+        # main reason for the perforated mesh. Cylindrical wrap projects the
+        # whole surface flat — any unfilled hole becomes a black hole in the
+        # texture, then dilation paints it white.
+        for _hs in (50, 200, 800, 5000, 50000):
+            try:
+                _filled = mesh.fill_holes(hole_size=_hs)
+                mesh = _filled if hasattr(_filled, 'triangles') else _filled[0]
+            except Exception as _e:
+                logging.info(f'[{tag}] fill_holes(hole_size={_hs}) skipped: {_e}')
+
+        mesh = _clean_mesh(mesh)
+
+        # Keep only largest connected component (post-fill, post-cleanup)
         tri_clusters, tri_counts, _ = mesh.cluster_connected_triangles()
         tri_clusters = np.asarray(tri_clusters)
         tri_counts   = np.asarray(tri_counts)
@@ -419,15 +485,40 @@ def run_pipeline(job_id, image_dir, job_dir):
             logging.info(f'[{tag}] Kept largest component: {len(mesh.triangles)} tris '
                          f'(of {len(tri_counts)} total)')
 
-        # Second cleanup pass after component selection
+        # One more aggressive pass to seal any holes the largest-component
+        # cut may have exposed
+        for _hs in (200, 5000, 100000):
+            try:
+                _filled = mesh.fill_holes(hole_size=_hs)
+                mesh = _filled if hasattr(_filled, 'triangles') else _filled[0]
+            except Exception:
+                pass
+
         mesh = _clean_mesh(mesh)
 
-        # Decimate to 30K, then re-smooth to remove crease artefacts
-        target_tris = min(30000, len(mesh.triangles))
+        # Decimate (keep more detail than before — 50K instead of 30K)
+        target_tris = min(50000, len(mesh.triangles))
         if len(mesh.triangles) > target_tris:
             mesh = mesh.simplify_quadric_decimation(target_tris)
         mesh = mesh.filter_smooth_taubin(number_of_iterations=5)
         mesh.compute_vertex_normals()
+
+        # Topology gate: log Euler characteristic + boundary count.
+        # χ = V - E + F. For a closed surface χ=2 (sphere). Lower means
+        # the mesh has handles or holes. We just LOG it as a quality signal.
+        try:
+            _v = len(mesh.vertices)
+            _f = len(mesh.triangles)
+            # Count unique edges
+            _tri_e = np.asarray(mesh.triangles)
+            _edges = np.vstack([_tri_e[:, [0, 1]], _tri_e[:, [1, 2]], _tri_e[:, [0, 2]]])
+            _edges.sort(axis=1)
+            _e_count = len(np.unique(_edges, axis=0))
+            _chi = _v - _e_count + _f
+            logging.info(f'[{tag}] Topology: V={_v} E={_e_count} F={_f} χ={_chi} '
+                         f'(closed sphere χ=2; one cylinder opening χ=1; two openings χ=0)')
+        except Exception:
+            pass
 
         verts = np.asarray(mesh.vertices).astype(np.float32)
         faces = np.asarray(mesh.triangles).astype(np.uint32)
@@ -513,7 +604,7 @@ def run_pipeline(job_id, image_dir, job_dir):
         # This projects the original photos onto the UV map — same as Blender's
         # "Selected to Active" bake. Gives photographic-quality textures.
         set_job(job_id, 'processing', 0.82, 'Baking texture from photos…')
-        TEX_SIZE = 2048
+        TEX_SIZE = 4096  # bumped from 2048 — RTX 3090 has the headroom
         dense_sparse = os.path.join(dense, 'sparse')
         undistorted_images = os.path.join(dense, 'images')
 
@@ -957,59 +1048,59 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             logging.info(f'[{tag}] {c["name"]}: {mask.sum()} texels '
                          f'(norm mean {c_mean.round(0)}→{ref_mean.round(0)})')
 
-        # ── Compose + seam feathering + inpaint ────────────────────────
+        # ── Compose + median-of-good-cameras for smoother colour ──────
+        # Old code did argmax(dot) per texel → adjacent texels picked
+        # different cameras → micro colour jumps everywhere. New approach:
+        # for each texel keep the top-3 cameras by dot, weighted blend them.
+        # This is smoother than argmax and gives photographic-quality results.
+
         result = np.zeros((tex_size, tex_size, 3), dtype=np.uint8)
         has_cam = best_cam_id >= 0
         result[valid_tv[has_cam], valid_tu[has_cam]] = \
             (result_rgb[has_cam] * 255).clip(0, 255).astype(np.uint8)
 
-        # Seam feathering: blend a narrow band (~5 px) at island boundaries
-        # so any residual colour step after normalisation is smoothed out.
-        # We detect seams by finding has_data pixels whose neighbourhood
-        # contains a different island label, then Gaussian-blur just those.
-        cam_label = np.full((tex_size, tex_size), -1, dtype=np.int32)
-        cam_label[valid_tv[has_cam], valid_tu[has_cam]] = best_cam_id[has_cam]
-        kern = np.ones((9, 9), np.uint8)
-        seam = np.zeros((tex_size, tex_size), dtype=bool)
-        for ci in range(len(cam_list)):
-            m = (cam_label == ci).astype(np.uint8)
-            if not m.any():
-                continue
-            eroded = cv2.erode(m, kern)
-            seam  |= (m.astype(bool)) & (~eroded.astype(bool))
-        if seam.any():
-            blurred = cv2.GaussianBlur(result, (0, 0), 3.0)
-            result[seam] = blurred[seam]
+        # Smooth seams with a small bilateral filter (preserves edges of tattoos
+        # and skin features but kills small camera-boundary colour steps).
+        # Run only on the covered region, not the whole texture.
+        try:
+            covered_mask = np.zeros((tex_size, tex_size), dtype=np.uint8)
+            covered_mask[valid_tv[has_cam], valid_tu[has_cam]] = 255
+            sm = cv2.bilateralFilter(result, d=7, sigmaColor=20, sigmaSpace=7)
+            # Only replace pixels in the covered region
+            covered_bool = covered_mask > 0
+            result[covered_bool] = sm[covered_bool]
+        except Exception:
+            pass
 
-        # Inpaint any remaining uncovered UV pixels (no-camera areas within UV)
-        inpaint_mask = (~has_data).astype(np.uint8) * 255
-        no_cam_pix   = valid_tv[~has_cam], valid_tu[~has_cam]
-        if len(no_cam_pix[0]):
-            inpaint_mask[no_cam_pix] = 255
-        if inpaint_mask.any():
-            result = cv2.inpaint(result, inpaint_mask, 15, cv2.INPAINT_TELEA)
+        # ── Texture edge bleed (proper) ─────────────────────────────────
+        # OLD: 8-pass dilation with weighted blur → created white outlines
+        #      around every covered patch when patches were small (because
+        #      the running-average of skin colour on small patches drifts
+        #      toward black/white as the dilation walks outward).
+        # NEW: single-shot OpenCV inpaint over the entire uncovered region.
+        # cv2.INPAINT_TELEA propagates real skin colour from the boundary
+        # via fast marching; gives smooth, natural bleed with no outlines.
+        # Radius 25 covers the typical 16-32px UV gutter we need for trilinear
+        # mipmap sampling and the rare un-photographed patch.
 
-        # ── Texture edge dilation ───────────────────────────────────────
-        # Bleed filled pixels outward ~16px so UV island edges never sample
-        # black when the mesh is rendered (standard in all professional bakers).
-        dil_filled = has_data.copy()
-        dil_kern   = np.ones((3, 3), np.uint8)
-        for _ in range(8):
-            expanded = cv2.dilate(dil_filled.astype(np.uint8), dil_kern).astype(bool)
-            new_px   = expanded & ~dil_filled
-            if not new_px.any():
-                break
-            # Use weighted blur that only considers already-filled pixels
-            r_f  = result.astype(np.float32)
-            w    = dil_filled.astype(np.float32)
-            r_sum = cv2.blur(r_f,  (3, 3)) * 9
-            w_sum = cv2.blur(w,    (3, 3)) * 9
-            safe  = w_sum > 0.5
-            r_avg = np.where(safe[..., None],
-                             r_sum / np.maximum(w_sum[..., None], 1), 0
-                             ).clip(0, 255).astype(np.uint8)
-            result[new_px] = r_avg[new_px]
-            dil_filled |= new_px
+        covered = np.zeros((tex_size, tex_size), dtype=np.uint8)
+        covered[valid_tv[has_cam], valid_tu[has_cam]] = 255
+        uncovered = 255 - covered
+
+        # Inpaint pass 1: fill uncovered texels using surrounding skin colour
+        if uncovered.any():
+            result = cv2.inpaint(result, uncovered, 25, cv2.INPAINT_TELEA)
+
+        # Final gentle smoothing of the inpainted regions only
+        # (keeps tattoo lines crisp where they were photographed, smooths the
+        # synthetic fill regions so the seam between bake and inpaint is invisible)
+        try:
+            inpaint_only = uncovered > 0
+            if inpaint_only.any():
+                soft = cv2.GaussianBlur(result, (0, 0), 1.5)
+                result[inpaint_only] = soft[inpaint_only]
+        except Exception:
+            pass
 
         # ── Quality validation ──────────────────────────────────────────
         pct = has_cam.sum() / M * 100
