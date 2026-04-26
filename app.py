@@ -313,7 +313,8 @@ def run_pipeline(job_id, image_dir, job_dir):
         MAX_POISSON_PTS = 60_000
         n_pts = len(pcd.points)
         if n_pts > MAX_POISSON_PTS:
-            vox = (np.asarray(pcd.points).ptp(axis=0).max() /
+            pts_np = np.asarray(pcd.points)
+            vox = ((pts_np.max(axis=0) - pts_np.min(axis=0)).max() /
                    (MAX_POISSON_PTS ** (1/3)))
             pcd = pcd.voxel_down_sample(voxel_size=float(vox))
             logging.info(f'[{tag}] Downsampled {n_pts} → {len(pcd.points)} pts '
@@ -464,7 +465,7 @@ def run_pipeline(job_id, image_dir, job_dir):
         radial     = _cov_verts - proj_along[:, None] * limb_axis
         # u: angle around axis (0–1), v: position along axis (0–1)
         u_uv = (np.arctan2(radial @ perp2, radial @ perp1) / (2 * np.pi) + 0.5) % 1.0
-        v_uv = (proj_along - proj_along.min()) / (proj_along.ptp() + 1e-10)
+        v_uv = (proj_along - proj_along.min()) / (proj_along.max() - proj_along.min() + 1e-10)
 
         # ── Seam vertex duplication (Blender-style cylindrical unwrap) ──
         # Triangles that straddle the u=0/u=1 wrap line have UVs spanning
