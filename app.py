@@ -354,9 +354,13 @@ def run_pipeline(job_id, image_dir, job_dir):
         centroids = (v_arr[f_arr[:, 0]] + v_arr[f_arr[:, 1]] + v_arr[f_arr[:, 2]]) / 3
         dists, _ = cKDTree(pcd_points).query(centroids)
 
-        # IQR outlier detection: faces with distance > Q3 + 1.5*IQR are background
+        # IQR outlier detection: faces with distance > Q3 + 3.0*IQR are background.
+        # 3.0 is intentionally loose — over-trimming was eating real mesh and
+        # leaving the perforations the user reported. Better to keep a few
+        # background tris (largest-component step removes them) than to drill
+        # holes through the limb.
         q1, q3 = np.percentile(dists, [25, 75])
-        iqr_thresh = q3 + 1.5 * (q3 - q1)
+        iqr_thresh = q3 + 3.0 * (q3 - q1)
         bg_mask = dists > iqr_thresh
         mesh.remove_triangles_by_mask(bg_mask)
         mesh.remove_unreferenced_vertices()
@@ -366,13 +370,15 @@ def run_pipeline(job_id, image_dir, job_dir):
         # Smooth before fill/cleanup so normals are coherent
         mesh = mesh.filter_smooth_taubin(number_of_iterations=10)
 
-        # Fill small holes left by trimming (e.g. narrow scan gaps)
-        # hole_size cap prevents filling the large intentional openings
-        # (wrist/ankle end of the scan)
-        try:
-            mesh = mesh.fill_holes(hole_size=300)
-        except Exception:
-            pass  # fill_holes may not be available in older Open3D builds
+        # Multi-pass hole fill: small gaps first, then progressively larger.
+        # Skip the largest pass to preserve the wrist/ankle scan opening.
+        for _hs in (100, 300, 1000):
+            try:
+                _filled = mesh.fill_holes(hole_size=_hs)
+                # fill_holes may return a TriangleMesh or a tuple in some builds
+                mesh = _filled if hasattr(_filled, 'triangles') else _filled[0]
+            except Exception:
+                pass  # fill_holes may not be available in older Open3D builds
 
         # Standard mesh cleanup — run twice: once before, once after hole-fill
         def _clean_mesh(m):
@@ -432,7 +438,8 @@ def run_pipeline(job_id, image_dir, job_dir):
             _elongation = 1.0
             _eigvecs = np.eye(3, dtype=np.float32)
         logging.info(f'[{tag}] PCA elongation ratio: {_elongation:.2f}')
-        USE_CYLINDRICAL = _elongation > 3.0
+        # Threshold 2.0 catches partial limb scans too (forearm fragments etc.).
+        USE_CYLINDRICAL = _elongation > 2.0
 
         if USE_CYLINDRICAL:
             logging.info(f'[{tag}] Elongated shape (ratio={_elongation:.1f}) → '
@@ -448,11 +455,48 @@ def run_pipeline(job_id, image_dir, job_dir):
             # u: angle around limb (0–1), v: position along limb (0–1)
             u_uv = (np.arctan2(radial @ perp2, radial @ perp1) / (2 * np.pi) + 0.5) % 1.0
             v_uv = (proj_along - proj_along.min()) / (proj_along.ptp() + 1e-10)
-            uvs       = np.stack([u_uv, v_uv], axis=1).astype(np.float32)
-            new_verts = verts
-            new_faces = faces
-            logging.info(f'[{tag}] Cylindrical UV: u=[{u_uv.min():.3f},{u_uv.max():.3f}] '
-                         f'v=[{v_uv.min():.3f},{v_uv.max():.3f}]')
+
+            # ── Seam vertex duplication (Blender-style cylindrical unwrap) ──
+            # Triangles that straddle the u=0/u=1 wrap line have UVs spanning
+            # almost the entire texture width. Without fixing this, every seam
+            # triangle becomes a long stretched "island" in the OBJ — exactly
+            # the artefact visible in the user's Procreate render. Standard
+            # fix: for each crossing triangle, copy any vertex with u<0.5 and
+            # set u' = u + 1.0 on the duplicate, then rewrite that face index.
+            # The result is a single continuous chart with one clean seam edge.
+            u_per_face = u_uv[faces]
+            crosses = (u_per_face.max(axis=1) - u_per_face.min(axis=1)) > 0.5
+
+            verts_list = list(verts)
+            u_list     = list(u_uv)
+            v_list     = list(v_uv)
+            faces_arr  = faces.astype(np.int64).copy()
+            shifted_v  = {}
+            for fi in np.where(crosses)[0]:
+                tri = faces[fi]
+                for i in range(3):
+                    v_idx = int(tri[i])
+                    if u_uv[v_idx] < 0.5:
+                        nidx = shifted_v.get(v_idx)
+                        if nidx is None:
+                            nidx = len(verts_list)
+                            verts_list.append(verts[v_idx])
+                            u_list.append(float(u_uv[v_idx]) + 1.0)
+                            v_list.append(float(v_uv[v_idx]))
+                            shifted_v[v_idx] = nidx
+                        faces_arr[fi, i] = nidx
+
+            new_verts = np.asarray(verts_list, dtype=np.float32)
+            new_faces = faces_arr.astype(np.uint32)
+            uvs = np.stack(
+                [np.asarray(u_list, dtype=np.float32),
+                 np.asarray(v_list, dtype=np.float32)],
+                axis=1
+            )
+            logging.info(f'[{tag}] Cylindrical UV: u=[{uvs[:,0].min():.3f},'
+                         f'{uvs[:,0].max():.3f}] v=[{uvs[:,1].min():.3f},'
+                         f'{uvs[:,1].max():.3f}], duplicated {len(shifted_v)} '
+                         f'seam verts across {int(crosses.sum())} crossing tris')
         else:
             logging.info(f'[{tag}] Compact shape (ratio={_elongation:.1f}) → xatlas UV')
             try:
@@ -689,12 +733,16 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             uv1 = uvs_np[faces_np[fi, 1]]
             uv2 = uvs_np[faces_np[fi, 2]]
 
-            # Cylindrical UV: skip triangles that straddle the u=0/u=1 seam.
-            # Their UV coordinates jump from ~0 to ~1 in u, making a huge
-            # triangle across the whole texture — skip those.
+            # Cylindrical UV: thanks to seam-vertex duplication in Step 9,
+            # crossing triangles now have continuous UVs with one or more
+            # vertices at u > 1.0. We rasterise them at their natural pixel
+            # coords (some px > tex_size) and wrap the destination texel
+            # via modulo at write time — gives a single seamless chart.
+            # Safety net: if a triangle still spans > 0.5 in u (shouldn't
+            # happen post-duplication), skip it to avoid a wrap-around smear.
             if use_cylindrical:
-                u_vals = (uv0[0], uv1[0], uv2[0])
-                if max(u_vals) - min(u_vals) > 0.5:
+                u_span = max(uv0[0], uv1[0], uv2[0]) - min(uv0[0], uv1[0], uv2[0])
+                if u_span > 0.5:
                     continue
 
             n = np.cross(v1 - v0, v2 - v0)
@@ -742,7 +790,13 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
 
             pos3d = (w0c[..., None]*v0 + w1c[..., None]*v1 + w2c[..., None]*v2).astype(np.float32)
             tv = np.clip((vv - 0.5).astype(int), 0, tex_size-1)
-            tu = np.clip((uu - 0.5).astype(int), 0, tex_size-1)
+            if use_cylindrical:
+                # Wrap u via modulo — duplicated seam verts have u > 1.0, so
+                # raw pixel coords go past tex_size and need to wrap back to
+                # the start of the row, producing a tileable, seamless texture.
+                tu = np.mod((uu - 0.5).astype(int), tex_size)
+            else:
+                tu = np.clip((uu - 0.5).astype(int), 0, tex_size-1)
 
             pos_map   [tv[inside], tu[inside]] = pos3d[inside]
             normal_map[tv[inside], tu[inside]] = n.astype(np.float32)
