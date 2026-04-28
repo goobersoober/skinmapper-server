@@ -232,18 +232,20 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
             except Exception as e:
                 logging.warning(f'[{tag}] Resize {fname}: {e}')
 
-        # 1 — Feature extraction (COLMAP 4.x auto-detects GPU; no explicit flag needed)
+        # 1 — Feature extraction (COLMAP 4.x renamed options to FeatureExtraction.*)
         run(['colmap', 'feature_extractor',
              '--database_path', db,
              '--image_path', image_dir,
              '--ImageReader.single_camera', '1',
-             '--SiftExtraction.max_image_size', str(_max_dim),
+             '--FeatureExtraction.use_gpu', '0',
+             '--FeatureExtraction.max_image_size', str(_max_dim),
              '--SiftExtraction.max_num_features', '8192'],
             0.08, 'Extracting features…')
 
-        # 2 — Matching
+        # 2 — Matching (COLMAP 4.x uses FeatureMatching.* prefix)
         run(['colmap', 'exhaustive_matcher',
-             '--database_path', db],
+             '--database_path', db,
+             '--FeatureMatching.use_gpu', '0'],
             0.18, 'Matching features…')
 
         # 3 — Sparse reconstruction
