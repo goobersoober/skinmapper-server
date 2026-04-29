@@ -7,3 +7,5 @@ scipy
 trimesh
 xatlas
 opencv-python-headless
+rembg
+onnxruntime

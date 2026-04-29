@@ -146,6 +146,154 @@ def cleanup_old_jobs():
             shutil.rmtree(os.path.join(JOBS_DIR, jid), ignore_errors=True)
 
 
+# ── Foreground masking (rembg) ───────────────────────────────────────
+# We segment skin/body from background BEFORE feeding photos to COLMAP.
+# Without this, walls, floor, clothing, and other off-body geometry get
+# reconstructed as part of the mesh and produce a lumpy non-skin shape
+# plus a shattered texture (different cameras pick up different chunks
+# of background and bake them onto the unwrap).
+
+# rembg session is heavy to construct; cache one per worker process.
+_REMBG_SESSION = None
+
+def _get_rembg_session():
+    global _REMBG_SESSION
+    if _REMBG_SESSION is None:
+        from rembg import new_session
+        _REMBG_SESSION = new_session('u2net')
+    return _REMBG_SESSION
+
+
+def generate_foreground_masks(image_dir, masks_dir, tag):
+    """
+    For each photo write a mask file at masks_dir/<image_name>.png.
+
+    COLMAP's --ImageReader.mask_path expects exactly this layout: a folder
+    of PNG masks named <original_image_filename>.png. White = features
+    allowed, black = features rejected. So `IMG_001.jpg` needs mask
+    `IMG_001.jpg.png`.
+
+    The mask is dilated by ~2% so silhouette features (which COLMAP needs
+    for matching) survive — without dilation the mask hugs the body too
+    tightly and matching gets weaker on the body's outline.
+    """
+    from rembg import remove
+    import cv2
+    import numpy as np
+    os.makedirs(masks_dir, exist_ok=True)
+    session = _get_rembg_session()
+    files = [f for f in os.listdir(image_dir)
+             if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    files.sort()
+    n_ok = 0
+    for fname in files:
+        try:
+            with open(os.path.join(image_dir, fname), 'rb') as f:
+                data = f.read()
+            mask_bytes = remove(data, session=session, only_mask=True,
+                                post_process_mask=True)
+            arr = np.frombuffer(mask_bytes, dtype=np.uint8)
+            mask = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                continue
+            # Slight dilation (~2% of image dim) so silhouette features survive.
+            k = max(3, int(min(mask.shape) * 0.02) | 1)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            # Binarise — COLMAP only checks > 0.
+            _, mask = cv2.threshold(mask, 64, 255, cv2.THRESH_BINARY)
+            cv2.imwrite(os.path.join(masks_dir, fname + '.png'), mask)
+            n_ok += 1
+        except Exception as e:
+            logging.warning(f'[{tag}] mask {fname}: {e}')
+    logging.info(f'[{tag}] Foreground masks: {n_ok}/{len(files)} generated')
+    return n_ok
+
+
+def filter_pcd_by_masks(pts, colors, masks_dir, sparse_dir, image_dir, tag,
+                       min_visible=2, min_foreground_ratio=0.55):
+    """
+    Reject points whose reprojection lands on background in most cameras.
+
+    For each 3D point we reproject into every COLMAP-registered camera.
+    A point survives only if among the cameras that actually see it
+    (in front of camera + within image bounds), the majority show it as
+    foreground in their rembg mask.
+
+    This catches background that slipped past the per-image feature mask
+    (e.g. wood-floor patches that share texture with skin).
+    """
+    import cv2
+    import numpy as np
+    cameras = _read_colmap_cameras_txt(os.path.join(sparse_dir, 'cameras.txt'))
+    images  = _read_colmap_images_txt(os.path.join(sparse_dir, 'images.txt'))
+    if not cameras or not images:
+        logging.info(f'[{tag}] mask filter: no COLMAP cameras, skipping')
+        return pts, colors
+
+    cam_list = []
+    mask_cache = {}
+    for img_info in images:
+        cam = cameras.get(img_info['camera_id'])
+        if cam is None:
+            continue
+        mask_path = os.path.join(masks_dir, img_info['name'] + '.png')
+        if not os.path.exists(mask_path):
+            continue
+        mask = mask_cache.get(mask_path)
+        if mask is None:
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                continue
+            mask_cache[mask_path] = mask
+        cam_list.append({**img_info, 'cam': cam, 'mask': mask})
+    if not cam_list:
+        logging.info(f'[{tag}] mask filter: no camera/mask pairs, skipping')
+        return pts, colors
+
+    P = pts.astype(np.float64)
+    visible_count   = np.zeros(len(P), dtype=np.int32)
+    foreground_count = np.zeros(len(P), dtype=np.int32)
+
+    for c in cam_list:
+        R, t  = c['R'], c['t']
+        cam   = c['cam']
+        mask  = c['mask']
+        mh, mw = mask.shape
+        # COLMAP image dimensions may differ from the mask if we resized
+        # the mask after generation — scale projected pixels to mask space.
+        sx = mw / float(cam['w'])
+        sy = mh / float(cam['h'])
+
+        pts_cam = (R @ P.T).T + t
+        in_front = pts_cam[:, 2] > 0.01
+        if not in_front.any():
+            continue
+        z = np.where(in_front, pts_cam[:, 2], 1.0)
+        u = cam['fx'] * pts_cam[:, 0] / z + cam['cx']
+        v = cam['fy'] * pts_cam[:, 1] / z + cam['cy']
+        mu = (u * sx).astype(np.int32)
+        mv = (v * sy).astype(np.int32)
+        in_bounds = in_front & (mu >= 0) & (mu < mw) & (mv >= 0) & (mv < mh)
+        if not in_bounds.any():
+            continue
+        visible_count[in_bounds] += 1
+        idx = np.where(in_bounds)[0]
+        fg = mask[mv[idx], mu[idx]] > 64
+        foreground_count[idx[fg]] += 1
+
+    seen   = visible_count >= min_visible
+    ratio  = np.divide(foreground_count, np.maximum(visible_count, 1),
+                       dtype=np.float32)
+    keep   = (~seen) | (ratio >= min_foreground_ratio)
+    n_drop = int((~keep).sum())
+    logging.info(f'[{tag}] Mask filter: dropped {n_drop}/{len(P)} pts '
+                 f'({n_drop/len(P)*100:.1f}%) as background')
+    if colors is not None:
+        return P[keep].astype(np.float32), colors[keep]
+    return P[keep].astype(np.float32), None
+
+
 # ── Pipeline ─────────────────────────────────────────────────────────
 
 def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='leg'):
@@ -165,8 +313,8 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
         logging.info(f'[{tag}] FAST_MODE: dim={_max_dim} tex={_tex_size} '
                      f'depth={_p_depth} maxpts={_max_pts} tris={_tgt_tris}')
     logging.info(f'[{tag}] scan_type={scan_type} body_part={body_part} → '
-                 f'{"PLANAR" if IS_PARTIAL_SCAN else "CYLINDRICAL"} UV, '
-                 f'trim={75 if IS_PARTIAL_SCAN else 85}th pct')
+                 f'trim={75 if IS_PARTIAL_SCAN else 85}th pct '
+                 f'(UV wrap/clip auto-detected from angular coverage)')
 
     try:
         db     = os.path.join(job_dir, 'db.db')
@@ -232,15 +380,28 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
             except Exception as e:
                 logging.warning(f'[{tag}] Resize {fname}: {e}')
 
+        # 0.5 — Foreground masks (rembg). Skin/body vs background.
+        # Without this, background features (wall, floor, clothing) match
+        # across photos and end up reconstructed as part of the mesh.
+        masks_dir = os.path.join(job_dir, 'masks')
+        set_job(job_id, 'processing', 0.05, 'Segmenting body from background…')
+        try:
+            n_masks = generate_foreground_masks(image_dir, masks_dir, tag)
+        except Exception as _e:
+            logging.warning(f'[{tag}] rembg masking failed: {_e}; continuing without masks')
+            n_masks = 0
+
         # 1 — Feature extraction (COLMAP 4.x renamed options to FeatureExtraction.*)
-        run(['colmap', 'feature_extractor',
-             '--database_path', db,
-             '--image_path', image_dir,
-             '--ImageReader.single_camera', '1',
-             '--FeatureExtraction.use_gpu', '0',
-             '--FeatureExtraction.max_image_size', str(_max_dim),
-             '--SiftExtraction.max_num_features', '8192'],
-            0.08, 'Extracting features…')
+        feat_cmd = ['colmap', 'feature_extractor',
+                    '--database_path', db,
+                    '--image_path', image_dir,
+                    '--ImageReader.single_camera', '1',
+                    '--FeatureExtraction.use_gpu', '0',
+                    '--FeatureExtraction.max_image_size', str(_max_dim),
+                    '--SiftExtraction.max_num_features', '8192']
+        if n_masks > 0:
+            feat_cmd += ['--ImageReader.mask_path', masks_dir]
+        run(feat_cmd, 0.08, 'Extracting features…')
 
         # 2 — Matching (COLMAP 4.x uses FeatureMatching.* prefix)
         run(['colmap', 'exhaustive_matcher',
@@ -395,6 +556,29 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
                 logging.info(f'[{tag}] RANSAC: no dominant plane ({_pct*100:.1f}% inliers), skipping')
         except Exception as _e:
             logging.info(f'[{tag}] RANSAC plane removal skipped: {_e}')
+
+        # ── Mask reprojection filter ──────────────────────────────────
+        # For every surviving point, project into every COLMAP camera and
+        # check the rembg mask. Drop points that land on background in
+        # the majority of cameras that see them. This is the second line
+        # of defence against background contamination — catches points
+        # the per-image feature mask let through.
+        if os.path.isdir(masks_dir):
+            try:
+                _pts_in  = np.asarray(pcd.points)
+                _cols_in = np.asarray(pcd.colors) if pcd.has_colors() else None
+                _pts_out, _cols_out = filter_pcd_by_masks(
+                    _pts_in, _cols_in, masks_dir,
+                    os.path.join(dense, 'sparse'), image_dir, tag)
+                if len(_pts_out) > 1000:  # only swap if filter left enough points
+                    pcd.points = o3d.utility.Vector3dVector(_pts_out)
+                    if _cols_out is not None:
+                        pcd.colors = o3d.utility.Vector3dVector(_cols_out)
+                else:
+                    logging.warning(f'[{tag}] Mask filter would leave only '
+                                    f'{len(_pts_out)} pts — skipping')
+            except Exception as _e:
+                logging.warning(f'[{tag}] Mask reprojection filter failed: {_e}')
 
         # Save point cloud for later (point-cloud guided mesh trimming)
         pcd_points = np.asarray(pcd.points)
@@ -607,11 +791,27 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
         if len(faces) < 100:
             raise RuntimeError('Mesh too small — try more overlapping photos.')
 
-        # ── Step 9: UV unwrap ───────────────────────────────────────────
-        # Always use cylindrical skin-peel UV — one continuous rectangle,
-        # u = angle around the body-part axis, v = position along the axis.
-        # This matches the manual Blender workflow (Smart UV Project):
-        # peel the surface flat, print it, wrap back perfectly. Zero islands.
+        # ── Step 9: Universal cylindrical UV unwrap ─────────────────────
+        # One algorithm works for every scan type — fullWrap, halfWrap, cap,
+        # patch, backPanel — by detecting actual angular coverage from the
+        # scan data and choosing wrap-vs-clip dynamically:
+        #
+        #   1. PCA on mesh → principal "long" axis (limb axis).
+        #   2. For each vertex compute (axial, angle, radius) cylindrical coords
+        #      where angle = atan2 around the limb axis.
+        #   3. Look at the point cloud's angular coverage. The largest empty
+        #      angular gap is the "back" of the scan (unphotographed side).
+        #          covered_arc = 2π − largest_gap.
+        #      • covered_arc > 270° → wrap mode (true cylinder, seam in the
+        #        empty gap, duplicate seam-crossing vertices).
+        #      • covered_arc ≤ 270° → clip mode (open strip, no seam, just
+        #        normalise the angular extent to [0,1]).
+        #   4. v = position along limb axis, normalised to [0,1].
+        #   5. u uses arc-length scaling (mean_radius × angle) so the unwrap
+        #      is isometric — 1 cm of skin in u ≈ 1 cm of skin in v.
+        #
+        # This is the proven photogrammetry skin-peel parameterisation —
+        # zero islands, minimal distortion, single seam (or no seam).
         set_job(job_id, 'processing', 0.76, 'UV unwrapping…')
 
         _cov_verts = verts - verts.mean(axis=0)
@@ -622,11 +822,7 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
             logging.warning(f'[{tag}] PCA eigendecomposition failed — using identity axes')
             _elongation = 1.0
             _eigvecs = np.eye(3, dtype=np.float32)
-        logging.info(f'[{tag}] PCA elongation ratio: {_elongation:.2f} → cylindrical UV')
 
-        # Principal axis = longest dimension (last eigenvector = largest eigenvalue).
-        # For a limb this is the long axis; for a compact shape it's still the
-        # best single axis to wrap around — always gives one seamless chart.
         limb_axis = _eigvecs[:, -1]
         perp1     = _eigvecs[:, -2]
         perp2     = np.cross(limb_axis, perp1)
@@ -634,51 +830,63 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
 
         proj_along = _cov_verts @ limb_axis
         radial     = _cov_verts - proj_along[:, None] * limb_axis
+        radial_x   = radial @ perp1
+        radial_y   = radial @ perp2
+        vert_angle = np.arctan2(radial_y, radial_x)
+        vert_radius = np.hypot(radial_x, radial_y)
 
-        # ── UV mode from scan_type sent by iOS app ─────────────────────
-        # fullWrap  = full 360° around limb → cylindrical UV
-        # halfWrap  = front-only / partial  → planar UV (no seam)
-        # cap       = shoulder/end cap      → planar UV
-        # patch     = small area            → planar UV
-        # backPanel = flat back area        → planar UV
-        # (IS_PARTIAL_SCAN set at top of run_pipeline from scan_type param)
+        # Angular coverage from the SCAN POINT CLOUD (not the mesh — the
+        # mesh contains hallucinated Poisson surface that lies behind the
+        # camera coverage). Sort the angles and find the largest cyclic gap.
+        _pcd_centered = pcd_points - verts.mean(axis=0)
+        _pcd_proj     = _pcd_centered @ limb_axis
+        _pcd_radial   = _pcd_centered - _pcd_proj[:, None] * limb_axis
+        _pcd_angles   = np.arctan2(_pcd_radial @ perp2, _pcd_radial @ perp1)
+        _sorted = np.sort(_pcd_angles)
+        _gaps   = np.diff(np.concatenate([_sorted, [_sorted[0] + 2 * np.pi]]))
+        _gap_i  = int(np.argmax(_gaps))
+        _max_gap     = float(_gaps[_gap_i])
+        covered_arc  = 2 * np.pi - _max_gap
+        gap_centre   = float(_sorted[_gap_i] + _max_gap / 2)
+        if gap_centre > np.pi:
+            gap_centre -= 2 * np.pi
+        logging.info(f'[{tag}] Angular coverage: {np.degrees(covered_arc):.1f}°, '
+                     f'largest gap centred at {np.degrees(gap_centre):.1f}°, '
+                     f'PCA elongation {_elongation:.2f}')
 
-        if IS_PARTIAL_SCAN:
-            # ── Planar UV (correct for front-only / half scans) ─────────
-            # Project vertices onto the scan plane:
-            #   u = position left-right across the leg (perp2 axis)
-            #   v = position up-down the leg (limb axis)
-            # No seam, no wrapping, no islands. One flat rectangle of skin.
-            u_raw = radial @ perp2   # left-right
-            v_raw = proj_along       # up-down
-            u_uv  = (u_raw - u_raw.min()) / (u_raw.max() - u_raw.min() + 1e-10)
-            v_uv  = (v_raw - v_raw.min()) / (v_raw.max() - v_raw.min() + 1e-10)
-        else:
-            # ── Cylindrical UV (correct for full 360° wrap scans) ───────
-            raw_angle = np.arctan2(radial @ perp2, radial @ perp1)
-            # Put seam at least-photographed angle
-            _pcd_centered = pcd_points - centroid
-            _pcd_proj = _pcd_centered @ limb_axis
-            _pcd_radial = _pcd_centered - _pcd_proj[:, None] * limb_axis
-            _pcd_angles = np.arctan2(_pcd_radial @ perp2, _pcd_radial @ perp1)
-            _hist, _bins = np.histogram(_pcd_angles, bins=36, range=(-np.pi, np.pi))
-            _seam_bin    = int(np.argmin(_hist))
-            _seam_angle  = float((_bins[_seam_bin] + _bins[_seam_bin + 1]) / 2)
-            logging.info(f'[{tag}] Cylindrical seam at {np.degrees(_seam_angle):.1f}°')
-            u_uv = ((raw_angle - _seam_angle) / (2 * np.pi) + 0.5) % 1.0
-            v_uv = (proj_along - proj_along.min()) / (proj_along.max() - proj_along.min() + 1e-10)
+        # iOS scan_type is treated as a hint, not a hard rule. If iOS said
+        # halfWrap but coverage is 350°, we use wrap mode anyway.
+        WRAP_THRESHOLD = np.radians(270)
+        wrap_mode = covered_arc >= WRAP_THRESHOLD
 
-        # ── Seam vertex duplication (cylindrical wrap only) ────────────
-        # Only needed for full-wrap cylindrical UV. Planar UV has no seam.
+        # Place the seam (or the cut for clip mode) at the centre of the
+        # empty gap — that's the artist-invisible side of the body.
+        # Re-centre angles so 0 = seam.
+        rel_angle = ((vert_angle - gap_centre + np.pi) % (2 * np.pi)) - np.pi
+
+        # ─── v coordinate (axial position) ──────────────────────────────
+        v_min, v_max = float(proj_along.min()), float(proj_along.max())
+        v_uv = (proj_along - v_min) / (v_max - v_min + 1e-10)
+
+        # ─── u coordinate ───────────────────────────────────────────────
         verts_list = list(verts)
-        u_list     = list(u_uv)
+        u_list     = []
         v_list     = list(v_uv)
         faces_arr  = faces.astype(np.int64).copy()
+        shifted_v  = {}
 
-        if not IS_PARTIAL_SCAN:
+        if wrap_mode:
+            # u ∈ [0,1) maps to angles seam→seam going around the body.
+            # Shift so seam is at u=0 and u=1 (cyclic).
+            u_uv = (rel_angle + np.pi) / (2 * np.pi)   # [0,1)
+            u_list = list(u_uv)
+            # Duplicate seam-crossing vertices: triangles whose vertex u-values
+            # span > 0.5 (i.e. straddle the seam) get their low-u vertices
+            # remapped to u' = u + 1.0 so the triangle rasterises continuously
+            # past the right edge of the texture. The bake function wraps
+            # texel writes via modulo so it's still a single tileable chart.
             u_per_face = u_uv[faces]
             crosses = (u_per_face.max(axis=1) - u_per_face.min(axis=1)) > 0.5
-            shifted_v = {}
             for fi in np.where(crosses)[0]:
                 tri = faces[fi]
                 for i in range(3):
@@ -692,6 +900,14 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
                             v_list.append(float(v_uv[v_idx]))
                             shifted_v[v_idx] = nidx
                         faces_arr[fi, i] = nidx
+        else:
+            # Clip mode: rel_angle is naturally in [-arc/2, +arc/2] for
+            # vertices near the front of the body; vertices on the trimmed
+            # back will be clamped to that range. Normalise the actual
+            # vertex angular extent to [0,1].
+            a_lo, a_hi = float(rel_angle.min()), float(rel_angle.max())
+            u_uv = (rel_angle - a_lo) / (a_hi - a_lo + 1e-10)
+            u_list = list(u_uv)
 
         new_verts = np.asarray(verts_list, dtype=np.float32)
         new_faces = faces_arr.astype(np.uint32)
@@ -700,15 +916,30 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
              np.asarray(v_list, dtype=np.float32)],
             axis=1
         )
-        if IS_PARTIAL_SCAN:
-            logging.info(f'[{tag}] Planar UV: u=[{uvs[:,0].min():.3f},'
-                         f'{uvs[:,0].max():.3f}] v=[{uvs[:,1].min():.3f},'
-                         f'{uvs[:,1].max():.3f}] (no seam)')
+
+        # Physical dimensions of the unwrapped chart (for 1:1 print scaling).
+        # Mesh is still in COLMAP units; final scale-normalise happens later.
+        mean_radius = float(np.median(vert_radius)) if len(vert_radius) else 0.0
+        if wrap_mode:
+            chart_u_units = 2 * np.pi * mean_radius
         else:
-            logging.info(f'[{tag}] Cylindrical UV: u=[{uvs[:,0].min():.3f},'
-                         f'{uvs[:,0].max():.3f}] v=[{uvs[:,1].min():.3f},'
-                         f'{uvs[:,1].max():.3f}], duplicated {len(shifted_v)} '
-                         f'seam verts across {int(crosses.sum())} crossing tris')
+            chart_u_units = (float(rel_angle.max()) - float(rel_angle.min())) * mean_radius
+        chart_v_units = float(v_max - v_min)
+        # Stash for scale.json
+        _uv_meta = dict(
+            wrap_mode=bool(wrap_mode),
+            covered_arc_deg=float(np.degrees(covered_arc)),
+            mean_radius_units=mean_radius,
+            chart_u_units=chart_u_units,
+            chart_v_units=chart_v_units,
+            seam_angle_deg=float(np.degrees(gap_centre)) if wrap_mode else None,
+        )
+
+        logging.info(f'[{tag}] UV {"WRAP" if wrap_mode else "CLIP"}: '
+                     f'u=[{uvs[:,0].min():.3f},{uvs[:,0].max():.3f}] '
+                     f'v=[{uvs[:,1].min():.3f},{uvs[:,1].max():.3f}] '
+                     f'duplicated={len(shifted_v)} verts, '
+                     f'aspect u/v={chart_u_units/(chart_v_units+1e-9):.2f}')
 
         # ── Step 10: Bake texture from photos using COLMAP camera poses ──
         # This projects the original photos onto the UV map — same as Blender's
@@ -722,7 +953,7 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
             new_verts, new_faces, uvs,
             undistorted_images, dense_sparse,
             TEX_SIZE, tag,
-            use_cylindrical=not IS_PARTIAL_SCAN
+            wrap_mode=wrap_mode,
         )
 
         # Fallback: if photo bake failed, use vertex colors from point cloud
@@ -740,13 +971,29 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
         # ── Step 12: Normalize scale + export ────────────────────────
         set_job(job_id, 'processing', 0.92, 'Packaging result…')
 
-        # Normalize to real-world scale (~0.35m longest axis)
+        # Per body part, pick a sensible default longest-axis size when
+        # there's no calibration object. iOS/Procreate can rescale later
+        # using scale.json once a known reference is available.
+        BODY_PART_LONGEST_M = {
+            'leg':       0.55,
+            'arm':       0.45,
+            'forearm':   0.30,
+            'hand':      0.20,
+            'shoulder':  0.30,
+            'back':      0.55,
+            'chest':     0.45,
+            'thigh':     0.50,
+        }
+        target_long = BODY_PART_LONGEST_M.get(body_part, 0.40)
         bbox = new_verts.max(axis=0) - new_verts.min(axis=0)
-        max_dim = bbox.max()
+        max_dim = float(bbox.max())
         if max_dim > 0:
-            scale = 0.35 / max_dim
+            scale = target_long / max_dim
             new_verts = new_verts * scale
-            logging.info(f'[{tag}] Normalized: scale={scale:.4f}')
+            logging.info(f'[{tag}] Normalised: longest axis → {target_long} m '
+                         f'(scale={scale:.4f})')
+        else:
+            scale = 1.0
 
         result_dir = os.path.join(job_dir, 'result')
         os.makedirs(result_dir, exist_ok=True)
@@ -758,18 +1005,47 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
         mtl_path = os.path.join(result_dir, 'mesh.mtl')
         write_obj(new_verts, new_faces, uvs, obj_path, mtl_path)
 
+        # scale.json — physical metadata for the iOS app and Procreate prints.
+        # All units in metres unless noted. Lets the artist export a 1:1
+        # printable stencil from the texture without guessing the size.
+        scale_path = os.path.join(result_dir, 'scale.json')
+        bbox_after = (new_verts.max(axis=0) - new_verts.min(axis=0)).tolist()
+        scale_meta = dict(
+            scan_type=scan_type,
+            body_part=body_part,
+            target_longest_m=target_long,
+            applied_scale=float(scale),
+            mesh_bbox_m=bbox_after,
+            uv=dict(
+                wrap_mode=_uv_meta['wrap_mode'],
+                covered_arc_deg=_uv_meta['covered_arc_deg'],
+                seam_angle_deg=_uv_meta['seam_angle_deg'],
+                # Physical chart dimensions, scaled to metres (texture aspect
+                # the artist should print at: chart_u_m × chart_v_m).
+                chart_u_m=_uv_meta['chart_u_units'] * scale,
+                chart_v_m=_uv_meta['chart_v_units'] * scale,
+            ),
+            texture_size=TEX_SIZE,
+            verts=int(len(new_verts)),
+            tris=int(len(new_faces)),
+        )
+        with open(scale_path, 'w') as _sf:
+            json.dump(scale_meta, _sf, indent=2)
+
         zip_path = os.path.join(job_dir, f'{job_id}.zip')
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
             zf.write(obj_path, 'mesh.obj')
             zf.write(mtl_path, 'mesh.mtl')
             zf.write(tex_path, 'mesh.png')
+            zf.write(scale_path, 'scale.json')
 
         result_size = os.path.getsize(zip_path)
 
         # ── Pipeline quality validation ─────────────────────────────────
         tri_cl, tri_ct, _ = mesh.cluster_connected_triangles()
         n_components = len(np.asarray(tri_ct))
-        uv_label = 'planar (1 island)' if IS_PARTIAL_SCAN else 'cylindrical (1 island)'
+        uv_label = ('cylindrical wrap (1 island, with seam)' if wrap_mode
+                    else 'cylindrical clip (1 island, no seam)')
         logging.info(f'[{tag}] ── Pipeline quality summary ─────────────')
         logging.info(f'[{tag}]   Mesh components : {n_components} (want 1)')
         logging.info(f'[{tag}]   UV method       : {uv_label}')
@@ -862,26 +1138,44 @@ def _read_colmap_images_txt(path):
 
 
 def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size, tag,
-                             use_cylindrical=False):
+                             wrap_mode=False):
     """
-    Project original photos onto the UV texture map using COLMAP camera poses.
+    Project original photos onto the UV texture using COLMAP camera poses.
 
-    use_cylindrical=True  (limb scans): per-TEXEL best-camera selection.
-      The cylindrical UV is one continuous surface — different cameras cover
-      different sides of the limb, so each texel independently picks the
-      most face-on camera. Seam-crossing triangles are skipped in rasterisation.
+    Per-texel best-camera selection with three quality features:
 
-    use_cylindrical=False (compact shapes): per-ISLAND best-camera selection.
-      Entire UV islands use the same camera → zero colour switching mid-island.
-      Matches how Reality Capture / Meshroom bake textures.
+      1. Occlusion testing — for every (texel, camera), cast a ray from
+         the texel along its surface normal toward the camera centre.
+         If the mesh occludes the camera before the ray reaches it, the
+         texel is invisible from that camera (e.g. front-of-leg texel
+         being scored by a back-of-leg photo).
+      2. Top-K weighted blending — instead of argmax(dot) per texel
+         (which switches camera abruptly at neighbouring texels and
+         produces visible "shards"), we keep the top-3 most face-on
+         cameras per texel and weighted-average them. Same approach as
+         RealityCapture's blended texturing.
+      3. Per-camera colour normalisation — each camera's skin pixels
+         are matched (mean+std) to a reference camera so blends are
+         seamless across exposure differences.
 
-    Two-pass approach (no redundant image I/O):
-      Pass 1 — geometry only: determine which camera wins each texel.
-      Pass 2 — sampling: load each image once, write all its texels.
+    Three passes:
+      Pass 1 — geometry: rasterise UV → 3D position + face normal map.
+      Pass 2 — visibility: for each camera, project all texels, occlusion
+               test, score; maintain top-K cameras per texel.
+      Pass 3 — sampling: load each image once, colour-normalise, sample
+               at the K stored pixel coords for every texel using it,
+               weighted accumulate into the result.
+
+    `wrap_mode=True` means the UV is a true cylindrical wrap with seam
+    vertices duplicated at u > 1; we modulo-wrap pixel writes so the
+    seam is tileable. `wrap_mode=False` (clip mode) does not wrap.
     """
     import cv2
     import numpy as np
+    import open3d as o3d
     from PIL import Image
+
+    TOP_K = 3
 
     try:
         cameras = _read_colmap_cameras_txt(os.path.join(sparse_dir, 'cameras.txt'))
@@ -890,7 +1184,6 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             logging.warning(f'[{tag}] No COLMAP cameras/images found — skipping photo bake')
             return None
 
-        # Filter to images that exist on disk and have valid intrinsics
         cam_list = []
         for img_info in images:
             img_path = os.path.join(image_dir, img_info['name'])
@@ -902,14 +1195,13 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             cam_list.append({**img_info, 'path': img_path, 'cam': cam})
         logging.info(f'[{tag}] Photo bake: {len(cam_list)} valid images out of {len(images)}')
         if not cam_list:
-            logging.warning(f'[{tag}] No valid image files found on disk')
             return None
 
         verts_np = np.array(verts, dtype=np.float64)
         faces_np = np.array(faces, dtype=np.int32)
         uvs_np   = np.array(uvs,   dtype=np.float32)
 
-        # ── Build UV→3D position + normal map ──────────────────────────
+        # ── Pass 1 — UV → 3D position + face normal ────────────────────
         pos_map    = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
         normal_map = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
         has_data   = np.zeros((tex_size, tex_size),    dtype=bool)
@@ -924,14 +1216,9 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             uv1 = uvs_np[faces_np[fi, 1]]
             uv2 = uvs_np[faces_np[fi, 2]]
 
-            # Cylindrical UV: thanks to seam-vertex duplication in Step 9,
-            # crossing triangles now have continuous UVs with one or more
-            # vertices at u > 1.0. We rasterise them at their natural pixel
-            # coords (some px > tex_size) and wrap the destination texel
-            # via modulo at write time — gives a single seamless chart.
-            # Safety net: if a triangle still spans > 0.5 in u (shouldn't
-            # happen post-duplication), skip it to avoid a wrap-around smear.
-            if use_cylindrical:
+            # Wrap mode safety net: post-duplication, no triangle should
+            # span > 0.5 in u. If one does, skip it to avoid wrap smear.
+            if wrap_mode:
                 u_span = max(uv0[0], uv1[0], uv2[0]) - min(uv0[0], uv1[0], uv2[0])
                 if u_span > 0.5:
                     continue
@@ -942,7 +1229,6 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
                 continue
             n = n / n_len
 
-            # UV → pixel coords (flip V: UV origin bottom-left, image origin top-left)
             px = np.array([
                 [uv0[0] * tex_size, (1 - uv0[1]) * tex_size],
                 [uv1[0] * tex_size, (1 - uv1[1]) * tex_size],
@@ -981,10 +1267,7 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
 
             pos3d = (w0c[..., None]*v0 + w1c[..., None]*v1 + w2c[..., None]*v2).astype(np.float32)
             tv = np.clip((vv - 0.5).astype(int), 0, tex_size-1)
-            if use_cylindrical:
-                # Wrap u via modulo — duplicated seam verts have u > 1.0, so
-                # raw pixel coords go past tex_size and need to wrap back to
-                # the start of the row, producing a tileable, seamless texture.
+            if wrap_mode:
                 tu = np.mod((uu - 0.5).astype(int), tex_size)
             else:
                 tu = np.clip((uu - 0.5).astype(int), 0, tex_size-1)
@@ -1000,41 +1283,47 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
 
         valid_pos = pos_map[valid_tv, valid_tu].astype(np.float64)
         valid_n   = normal_map[valid_tv, valid_tu].astype(np.float64)
+        # Normalise the rasterised face-normals (they're unit by construction
+        # but rasterisation may have written a degenerate face's all-zeros).
+        n_lens   = np.linalg.norm(valid_n, axis=1)
+        good_n   = n_lens > 1e-6
+        valid_n[good_n] /= n_lens[good_n, None]
         M = len(valid_tv)
         logging.info(f'[{tag}] UV rasterised: {M} texels')
 
-        # ── Pass 1 — geometry only, no image I/O ───────────────────────
-        # For cylindrical UV (one continuous surface):
-        #   Per-TEXEL selection — each texel picks the most face-on camera.
-        #   Different cameras cover front/back/sides of the limb; per-texel
-        #   ensures every part of the skin uses the sharpest available photo.
-        # For island UV (xatlas, compact shapes):
-        #   Per-ISLAND selection — whole island uses the same camera → no
-        #   colour switching mid-patch (same as RC / Meshroom bake).
+        # ── Build raycaster from the final mesh for occlusion testing ──
+        # An open3d t.geometry RaycastingScene is C++/embree backed and
+        # accepts batched ray casts for fast per-camera occlusion checks.
+        try:
+            mesh_t = o3d.t.geometry.TriangleMesh()
+            mesh_t.vertex.positions = o3d.core.Tensor(verts_np.astype(np.float32))
+            mesh_t.triangle.indices = o3d.core.Tensor(faces_np.astype(np.uint32))
+            scene = o3d.t.geometry.RaycastingScene()
+            scene.add_triangles(mesh_t)
+            occlusion_ok = True
+        except Exception as _e:
+            logging.warning(f'[{tag}] RaycastingScene init failed: {_e} — '
+                            f'continuing without occlusion testing')
+            scene = None
+            occlusion_ok = False
 
+        # ── Pass 2 — per camera: project, occlusion-test, top-K update ──
         cam_texel_count = np.zeros(len(cam_list), dtype=np.int64)
+        topk_score = np.full((M, TOP_K), -np.inf, dtype=np.float32)
+        topk_cam   = np.full((M, TOP_K), -1, dtype=np.int32)
+        topk_ix    = np.zeros((M, TOP_K), dtype=np.float32)
+        topk_iy    = np.zeros((M, TOP_K), dtype=np.float32)
 
-        # Storage for pixel coords (M × N_cams) — used in Pass 2
-        all_img_x = np.zeros((M, len(cam_list)), dtype=np.float32)
-        all_img_y = np.zeros((M, len(cam_list)), dtype=np.float32)
-
-        if use_cylindrical:
-            # Per-texel: track best camera score for each texel individually
-            texel_best_score = np.full(M, -np.inf, dtype=np.float64)
-            texel_best_cam   = np.full(M, -1, dtype=np.int32)
-        else:
-            # Per-island: connected components → aggregate scores per island
-            num_islands, island_map = cv2.connectedComponents(has_data.astype(np.uint8))
-            island_ids = island_map[valid_tv, valid_tu]  # (M,) — island per texel
-            logging.info(f'[{tag}] UV has {num_islands - 1} islands')
-            island_cam_score = np.zeros((num_islands, len(cam_list)), dtype=np.float64)
+        # Use a small offset along the surface normal so rays start just
+        # above the surface and don't self-intersect.
+        ray_origin = (valid_pos + valid_n * 5e-4).astype(np.float32)
 
         for ci, c in enumerate(cam_list):
             R, t    = c['R'], c['t']
             cam     = c['cam']
             cam_pos = -R.T @ t
 
-            pts_cam  = (R @ valid_pos.T).T + t
+            pts_cam = (R @ valid_pos.T).T + t
             in_front = pts_cam[:, 2] > 0.01
 
             fx, fy, cx_c, cy_c = cam['fx'], cam['fy'], cam['cx'], cam['cy']
@@ -1045,85 +1334,86 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
 
             in_bounds = (img_x >= 0) & (img_x < iw - 1) & \
                         (img_y >= 0) & (img_y < ih - 1)
-            vd  = cam_pos - valid_pos
-            dot = np.einsum('ij,ij->i', valid_n,
-                            vd / (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10))
 
-            visible = in_front & in_bounds & (dot > 0.1)
+            view = cam_pos - valid_pos
+            view_len = np.linalg.norm(view, axis=1)
+            view_dir = view / (view_len[:, None] + 1e-10)
+            dot = np.einsum('ij,ij->i', valid_n, view_dir)
+
+            visible = in_front & in_bounds & (dot > 0.15)
+
+            # Occlusion test: cast rays from texel toward camera; first-hit
+            # distance must be at least the texel→camera distance (i.e. the
+            # ray exits the mesh before reaching the camera). 2 mm slack.
+            if occlusion_ok and visible.any():
+                idx_v = np.where(visible)[0]
+                rays = np.empty((len(idx_v), 6), dtype=np.float32)
+                rays[:, :3] = ray_origin[idx_v]
+                rays[:, 3:] = view_dir[idx_v].astype(np.float32)
+                try:
+                    hits = scene.cast_rays(o3d.core.Tensor(rays))
+                    t_hit = hits['t_hit'].numpy()
+                    occluded = t_hit < (view_len[idx_v] - 0.002)
+                    visible[idx_v[occluded]] = False
+                except Exception as _e:
+                    logging.warning(f'[{tag}] cast_rays failed for {c["name"]}: {_e}')
+
             cam_texel_count[ci] = int(visible.sum())
+            if not visible.any():
+                continue
 
-            if use_cylindrical:
-                # Per-texel: update where this camera has the best view angle
-                better = visible & (dot > texel_best_score)
-                texel_best_score[better] = dot[better]
-                texel_best_cam[better]   = ci
-            else:
-                # Per-island: accumulate total dot score into each island
-                np.add.at(island_cam_score[:, ci], island_ids[visible], dot[visible])
+            # Top-K update — for each visible texel, replace the worst slot
+            # if this camera scores higher.
+            score = dot.astype(np.float32)
+            min_slot = np.argmin(topk_score, axis=1)                # (M,)
+            min_val  = topk_score[np.arange(M), min_slot]           # (M,)
+            update   = visible & (score > min_val)
+            if update.any():
+                ui = np.where(update)[0]
+                slots = min_slot[ui]
+                topk_score[ui, slots] = score[ui]
+                topk_cam  [ui, slots] = ci
+                topk_ix   [ui, slots] = img_x[ui].astype(np.float32)
+                topk_iy   [ui, slots] = img_y[ui].astype(np.float32)
 
-            all_img_x[:, ci] = img_x.astype(np.float32)
-            all_img_y[:, ci] = img_y.astype(np.float32)
-
-        # --- Resolve best camera per texel --------------------------------
-        if use_cylindrical:
-            best_cam_id  = texel_best_cam                                   # (M,)
-            cam_idx_safe = np.clip(best_cam_id, 0, len(cam_list) - 1)
-            best_img_x   = all_img_x[np.arange(M), cam_idx_safe].astype(np.float64)
-            best_img_y   = all_img_y[np.arange(M), cam_idx_safe].astype(np.float64)
-            best_cam_id[texel_best_score < 0] = -1   # no camera covered this texel
-            del all_img_x, all_img_y
-            claimed = (best_cam_id >= 0).sum()
-            logging.info(f'[{tag}] Cylindrical per-texel: {claimed}/{M} texels '
-                         f'({claimed/M*100:.1f}%) covered')
-        else:
-            island_best = np.argmax(island_cam_score, axis=1)      # (num_islands,)
-            island_best[island_cam_score.max(axis=1) <= 0] = -1    # uncovered islands
-            best_cam_id  = island_best[island_ids].astype(np.int32)
-            cam_idx_safe = np.clip(best_cam_id, 0, len(cam_list) - 1)
-            best_img_x   = all_img_x[np.arange(M), cam_idx_safe].astype(np.float64)
-            best_img_y   = all_img_y[np.arange(M), cam_idx_safe].astype(np.float64)
-            best_cam_id[island_ids == 0] = -1   # background texels
-            del all_img_x, all_img_y
-            claimed = (best_cam_id >= 0).sum()
-            logging.info(f'[{tag}] Island assignment: {(island_best>=0).sum()}/'
-                         f'{num_islands-1} islands → {claimed}/{M} texels '
-                         f'({claimed/M*100:.1f}%)')
-
+        any_cam = (topk_cam >= 0).any(axis=1)
+        claimed = int(any_cam.sum())
+        logging.info(f'[{tag}] Per-texel top-{TOP_K}: {claimed}/{M} texels '
+                     f'({claimed/M*100:.1f}%) covered after occlusion test')
         if claimed == 0:
-            logging.warning(f'[{tag}] No texels claimed')
             return None
 
-        # ── Pass 2 — load images, colour-normalise, sample ─────────────
-        # Why colour normalisation?
-        #   Different photos have different exposures / white-balances.
-        #   Without correction, the boundary between two island-cameras
-        #   is visible as a colour step even though the seam is geometrically
-        #   correct. Normalising all cameras to the same statistics removes
-        #   that step.
-        #
-        # Method: match each camera's per-channel mean + std to the
-        # dominant camera (the one assigned the most texels = best-lit,
-        # most face-on). This is the standard approach in remote sensing
-        # and photogrammetry for multi-image colour balancing.
-
+        # ── Pass 3 — colour-normalise, sample, weighted blend ──────────
         ref_ci  = int(cam_texel_count.argmax())
         ref_img = cv2.cvtColor(cv2.imread(cam_list[ref_ci]['path']),
                                cv2.COLOR_BGR2RGB).astype(np.float32)
-        # Compute reference stats on skin pixels only (not pure black/white)
         ref_flat = ref_img.reshape(-1, 3)
         skin_mask = (ref_flat.max(axis=1) > 20) & (ref_flat.max(axis=1) < 250)
-        ref_mean = ref_flat[skin_mask].mean(axis=0) if skin_mask.sum() > 100 \
-                   else ref_flat.mean(axis=0)
-        ref_std  = ref_flat[skin_mask].std(axis=0)  + 1e-6 if skin_mask.sum() > 100 \
-                   else ref_flat.std(axis=0) + 1e-6
+        if skin_mask.sum() > 100:
+            ref_mean = ref_flat[skin_mask].mean(axis=0)
+            ref_std  = ref_flat[skin_mask].std(axis=0) + 1e-6
+        else:
+            ref_mean = ref_flat.mean(axis=0)
+            ref_std  = ref_flat.std(axis=0) + 1e-6
         logging.info(f'[{tag}] Colour ref: {cam_list[ref_ci]["name"]} '
-                     f'mean={ref_mean.round(1)} std={ref_std.round(1)}')
+                     f'mean={ref_mean.round(1)}')
+
+        # Soft top-K weighting: weight ∝ score - min_top_k_score, so the
+        # most face-on camera dominates but the others still contribute.
+        valid_slot = topk_cam >= 0
+        scores = np.where(valid_slot, topk_score, -np.inf).astype(np.float32)
+        # Shift scores so the lowest valid one is 0 → makes weights non-negative.
+        row_min = np.where(valid_slot, scores, np.inf).min(axis=1, keepdims=True)
+        row_min = np.where(np.isfinite(row_min), row_min, 0)
+        shifted = np.where(valid_slot, scores - row_min + 1e-3, 0)
+        wsum    = shifted.sum(axis=1, keepdims=True)
+        weights = np.where(wsum > 0, shifted / wsum, 0).astype(np.float32)
 
         result_rgb = np.zeros((M, 3), dtype=np.float32)
 
         for ci, c in enumerate(cam_list):
-            mask = best_cam_id == ci
-            if not mask.any():
+            slots = (topk_cam == ci)
+            if not slots.any():
                 continue
 
             img_bgr = cv2.imread(c['path'])
@@ -1131,8 +1421,6 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
                 continue
             img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
 
-            # Colour normalisation: shift + scale per channel so this
-            # camera's skin statistics match the reference camera.
             flat = img.reshape(-1, 3)
             sk   = (flat.max(axis=1) > 20) & (flat.max(axis=1) < 250)
             if sk.sum() > 100:
@@ -1141,93 +1429,71 @@ def bake_texture_from_photos(verts, faces, uvs, image_dir, sparse_dir, tex_size,
             else:
                 c_mean = flat.mean(axis=0)
                 c_std  = flat.std(axis=0) + 1e-6
-            img_norm = ((img - c_mean) / c_std * ref_std + ref_mean)
-            img_norm = np.clip(img_norm, 0, 255)
-
+            img_norm = ((img - c_mean) / c_std * ref_std + ref_mean).clip(0, 255)
             ih_i, iw_i = img_norm.shape[:2]
-            sx = best_img_x[mask]; sy = best_img_y[mask]
-            x0 = np.clip(sx.astype(int), 0, iw_i - 2)
-            y0 = np.clip(sy.astype(int), 0, ih_i - 2)
-            xf = sx - x0; yf = sy - y0
 
-            sampled = (img_norm[y0,   x0  ] * ((1-xf)*(1-yf))[:, None] +
-                       img_norm[y0,   x0+1] * (   xf *(1-yf))[:, None] +
-                       img_norm[y0+1, x0  ] * ((1-xf)*   yf )[:, None] +
-                       img_norm[y0+1, x0+1] * (   xf *   yf )[:, None])
-            result_rgb[mask] = sampled / 255.0
-            logging.info(f'[{tag}] {c["name"]}: {mask.sum()} texels '
-                         f'(norm mean {c_mean.round(0)}→{ref_mean.round(0)})')
+            # For each slot k, gather the texels that selected this camera
+            # at slot k, sample (bilinear) at the stored pixel coord, and
+            # add weighted contribution.
+            for k in range(TOP_K):
+                mask_ck = slots[:, k]
+                if not mask_ck.any():
+                    continue
+                sx = topk_ix[mask_ck, k].astype(np.float64)
+                sy = topk_iy[mask_ck, k].astype(np.float64)
+                x0 = np.clip(sx.astype(int), 0, iw_i - 2)
+                y0 = np.clip(sy.astype(int), 0, ih_i - 2)
+                xf = sx - x0; yf = sy - y0
+                sampled = (img_norm[y0,   x0  ] * ((1-xf)*(1-yf))[:, None] +
+                           img_norm[y0,   x0+1] * (   xf *(1-yf))[:, None] +
+                           img_norm[y0+1, x0  ] * ((1-xf)*   yf )[:, None] +
+                           img_norm[y0+1, x0+1] * (   xf *   yf )[:, None])
+                w_k = weights[mask_ck, k:k+1]
+                result_rgb[mask_ck] += sampled.astype(np.float32) * w_k / 255.0
 
-        # ── Compose + median-of-good-cameras for smoother colour ──────
-        # Old code did argmax(dot) per texel → adjacent texels picked
-        # different cameras → micro colour jumps everywhere. New approach:
-        # for each texel keep the top-3 cameras by dot, weighted blend them.
-        # This is smoother than argmax and gives photographic-quality results.
+            logging.info(f'[{tag}] {c["name"]}: '
+                         f'{int(slots.any(axis=1).sum())} texels '
+                         f'(mean→ref shift {(c_mean-ref_mean).round(0).tolist()})')
 
+        result_rgb = np.clip(result_rgb, 0, 1)
         result = np.zeros((tex_size, tex_size, 3), dtype=np.uint8)
-        has_cam = best_cam_id >= 0
-        result[valid_tv[has_cam], valid_tu[has_cam]] = \
-            (result_rgb[has_cam] * 255).clip(0, 255).astype(np.uint8)
+        result[valid_tv[any_cam], valid_tu[any_cam]] = \
+            (result_rgb[any_cam] * 255).astype(np.uint8)
 
-        # Smooth seams with a small bilateral filter (preserves edges of tattoos
-        # and skin features but kills small camera-boundary colour steps).
-        # Run only on the covered region, not the whole texture.
+        # Bilateral filter on the covered region — kills micro colour
+        # boundaries between top-K transitions while keeping tattoo edges.
         try:
-            covered_mask = np.zeros((tex_size, tex_size), dtype=np.uint8)
-            covered_mask[valid_tv[has_cam], valid_tu[has_cam]] = 255
-            sm = cv2.bilateralFilter(result, d=7, sigmaColor=20, sigmaSpace=7)
-            # Only replace pixels in the covered region
-            covered_bool = covered_mask > 0
-            result[covered_bool] = sm[covered_bool]
+            sm = cv2.bilateralFilter(result, d=7, sigmaColor=18, sigmaSpace=7)
+            covered_mask = np.zeros((tex_size, tex_size), dtype=bool)
+            covered_mask[valid_tv[any_cam], valid_tu[any_cam]] = True
+            result[covered_mask] = sm[covered_mask]
         except Exception:
             pass
 
-        # ── Texture edge bleed (proper) ─────────────────────────────────
-        # OLD: 8-pass dilation with weighted blur → created white outlines
-        #      around every covered patch when patches were small (because
-        #      the running-average of skin colour on small patches drifts
-        #      toward black/white as the dilation walks outward).
-        # NEW: single-shot OpenCV inpaint over the entire uncovered region.
-        # cv2.INPAINT_TELEA propagates real skin colour from the boundary
-        # via fast marching; gives smooth, natural bleed with no outlines.
-        # Radius 25 covers the typical 16-32px UV gutter we need for trilinear
-        # mipmap sampling and the rare un-photographed patch.
-
+        # Inpaint uncovered region with TELEA (propagates real skin colour
+        # from the edge of the photographic patch via fast marching).
         covered = np.zeros((tex_size, tex_size), dtype=np.uint8)
-        covered[valid_tv[has_cam], valid_tu[has_cam]] = 255
+        covered[valid_tv[any_cam], valid_tu[any_cam]] = 255
         uncovered = 255 - covered
-
-        # Inpaint pass 1: fill uncovered texels using surrounding skin colour
         if uncovered.any():
             result = cv2.inpaint(result, uncovered, 25, cv2.INPAINT_TELEA)
-
-        # Final gentle smoothing of the inpainted regions only
-        # (keeps tattoo lines crisp where they were photographed, smooths the
-        # synthetic fill regions so the seam between bake and inpaint is invisible)
-        try:
-            inpaint_only = uncovered > 0
-            if inpaint_only.any():
+            try:
                 soft = cv2.GaussianBlur(result, (0, 0), 1.5)
+                inpaint_only = uncovered > 0
                 result[inpaint_only] = soft[inpaint_only]
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-        # ── Quality validation ──────────────────────────────────────────
-        pct = has_cam.sum() / M * 100
-        if use_cylindrical:
-            uv_mode = 'cylindrical (1 island)'
-        else:
-            n_isl = num_islands - 1
-            uv_mode = f'xatlas ({n_isl} islands)'
-        logging.info(f'[{tag}] ── Quality report ──────────────────────')
-        logging.info(f'[{tag}]   UV mode       : {uv_mode}')
+        pct = claimed / M * 100
+        logging.info(f'[{tag}] ── Bake quality ────────────────────────')
+        logging.info(f'[{tag}]   UV mode       : {"wrap (cylinder + seam)" if wrap_mode else "clip (open strip)"}')
         logging.info(f'[{tag}]   Texels covered: {pct:.1f}%')
-        logging.info(f'[{tag}]   Dilation done : 8 passes (~16px bleed)')
+        logging.info(f'[{tag}]   Occlusion     : {"ON" if occlusion_ok else "OFF"}')
+        logging.info(f'[{tag}]   Top-K blend   : {TOP_K} cameras/texel weighted')
         if pct < 50:
             logging.warning(f'[{tag}]   !! Low coverage — check mesh/camera poses')
         logging.info(f'[{tag}] ────────────────────────────────────────')
 
-        logging.info(f'[{tag}] Bake complete: {pct:.1f}% of UV from photos')
         return Image.fromarray(result)
 
     except Exception:
