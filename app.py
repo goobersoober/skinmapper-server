@@ -859,10 +859,39 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
         WRAP_THRESHOLD = np.radians(270)
         wrap_mode = covered_arc >= WRAP_THRESHOLD
 
-        # Place the seam (or the cut for clip mode) at the centre of the
-        # empty gap — that's the artist-invisible side of the body.
-        # Re-centre angles so 0 = seam.
-        rel_angle = ((vert_angle - gap_centre + np.pi) % (2 * np.pi)) - np.pi
+        if wrap_mode:
+            # Wrap: seam at the gap centre (least-photographed side).
+            # rel_angle=0 at gap, ±π at scan front.
+            rel_angle = ((vert_angle - gap_centre + np.pi) % (2 * np.pi)) - np.pi
+        else:
+            # Clip (open strip): centre on the SCAN FRONT so the scanned
+            # region is a single continuous interval around rel_angle=0.
+            # The gap/hallucinated back side lands at |rel_angle| > covered_arc/2.
+            scan_centre = gap_centre + np.pi
+            rel_angle = ((vert_angle - scan_centre + np.pi) % (2 * np.pi)) - np.pi
+
+            # Remove Poisson-hallucinated faces in the unscanned gap before UV.
+            # Trim 10° inside the scan boundary so edge-bridging triangles are
+            # also removed (they produce seam-spanning UV ranges → overlapping UVs).
+            scan_half = covered_arc / 2
+            trim_margin = np.radians(10)
+            vert_in_gap = np.abs(rel_angle) > (scan_half - trim_margin)
+            face_has_gap = np.any(vert_in_gap[faces], axis=1)
+            n_gap = int(face_has_gap.sum())
+            if n_gap > 0:
+                faces = faces[~face_has_gap]
+                if len(faces) < 50:
+                    raise RuntimeError('Gap cull removed too many faces — try more overlapping photos.')
+                used = np.zeros(len(verts), dtype=bool)
+                used[faces.flatten()] = True
+                old2new = np.full(len(verts), -1, dtype=np.int64)
+                old2new[used] = np.arange(used.sum(), dtype=np.int64)
+                verts       = verts[used]
+                faces       = old2new[faces]
+                proj_along  = proj_along[used]
+                rel_angle   = rel_angle[used]
+                vert_radius = vert_radius[used]
+                logging.info(f'[{tag}] Gap cull: removed {n_gap} hallucinated faces, {len(faces)} remain')
 
         # ─── v coordinate (axial position) ──────────────────────────────
         v_min, v_max = float(proj_along.min()), float(proj_along.max())
@@ -901,10 +930,8 @@ def run_pipeline(job_id, image_dir, job_dir, scan_type='halfWrap', body_part='le
                             shifted_v[v_idx] = nidx
                         faces_arr[fi, i] = nidx
         else:
-            # Clip mode: rel_angle is naturally in [-arc/2, +arc/2] for
-            # vertices near the front of the body; vertices on the trimmed
-            # back will be clamped to that range. Normalise the actual
-            # vertex angular extent to [0,1].
+            # Clip mode: remaining verts span only the actual scanned arc.
+            # a_lo/a_hi are the true scan edges → maps to [0, 1].
             a_lo, a_hi = float(rel_angle.min()), float(rel_angle.max())
             u_uv = (rel_angle - a_lo) / (a_hi - a_lo + 1e-10)
             u_list = list(u_uv)
